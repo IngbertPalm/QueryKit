@@ -517,6 +517,12 @@ public static class FilterParser
                 // by constructing it from the string value using a constructor that takes the target type
                 if (propertyConfig.ConversionTargetType == typeof(string))
                 {
+                    // An in/not-in list has to stay an array of constants, so each item is converted on its own.
+                    if (IsArrayLiteral(right) && CreateStringConversionArrayExpr(leftExpr.Type, right) is { } arrayExpr)
+                    {
+                        return arrayExpr;
+                    }
+
                     var stringCtor = leftExpr.Type.GetConstructor(new[] { typeof(string) });
                     if (stringCtor != null)
                     {
@@ -540,11 +546,53 @@ public static class FilterParser
             {
                 // The lookup by query name above misses a property with a different query name. v1.14.2 then threw,
                 // because it can not read a value of this type, so find the conversion by the property path instead.
+                if (IsArrayLiteral(right) && CreateStringConversionArrayExpr(leftExpr.Type, right) is { } pathArrayExpr)
+                {
+                    return pathArrayExpr;
+                }
+
                 return CreateStringConversionRightExpr(leftExpr.Type, right) ?? CreateRightExprFromType(targetType, right, rightIsQuotedLiteral, op);
             }
         }
 
         return CreateRightExprFromType(targetType, right, rightIsQuotedLiteral, op);
+    }
+
+    private static bool IsArrayLiteral(string right)
+        => right.StartsWith("[") && right.EndsWith("]");
+
+    // Builds the right side of an in/not-in filter for a property with HasConversion<string>(). The in operator
+    // reads an array of constants, so every item is constructed from its string with the (string) constructor.
+    private static Expression? CreateStringConversionArrayExpr(Type leftType, string right)
+    {
+        var underlyingType = Nullable.GetUnderlyingType(leftType);
+        var stringCtor = (underlyingType ?? leftType).GetConstructor(new[] { typeof(string) });
+        if (stringCtor == null)
+        {
+            return null;
+        }
+
+        var body = right.Substring(1, right.Length - 2);
+        var items = body.Length == 0
+            ? Array.Empty<string>()
+            : body.Split(',').Select(x => x.Trim()).ToArray();
+
+        var constants = items.Select(item =>
+        {
+            if (item == "null")
+            {
+                return Expression.Constant(null, leftType);
+            }
+
+            if (item.Length >= 2 && item.StartsWith("\"") && item.EndsWith("\""))
+            {
+                item = item.Substring(1, item.Length - 2);
+            }
+
+            return Expression.Constant(stringCtor.Invoke(new object[] { item }), leftType);
+        }).ToArray();
+
+        return Expression.NewArrayInit(leftType, constants);
     }
 
     // Builds the right side for a property with HasConversion<string>() from a constructor that takes a string.
