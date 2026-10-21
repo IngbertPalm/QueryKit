@@ -3,6 +3,7 @@ namespace QueryKit.IntegrationTests.Tests;
 using System.Globalization;
 using System.Linq.Expressions;
 using Configuration;
+using Exceptions;
 using FluentAssertions;
 using Microsoft.EntityFrameworkCore;
 using Operators;
@@ -15,7 +16,7 @@ using WebApiTestProject.Entities.Recipes;
 public class FilterParsingRegressionTests : TestBase
 {
     [Fact]
-    public async Task operator_alias_text_inside_quoted_value_is_replaced()
+    public async Task operator_alias_text_inside_quoted_value_is_kept()
     {
         // Arrange
         var testingServiceScope = new TestingServiceScope();
@@ -41,7 +42,8 @@ public class FilterParsingRegressionTests : TestBase
         var people = await appliedQueryable.ToListAsync();
 
         // Assert
-        people.Should().BeEmpty();
+        people.Count.Should().Be(1);
+        people[0].Id.Should().Be(fakePersonOne.Id);
     }
 
     [Fact]
@@ -82,7 +84,7 @@ public class FilterParsingRegressionTests : TestBase
     }
 
     [Fact]
-    public async Task list_value_with_comma_is_split_into_items()
+    public async Task list_value_with_comma_is_one_item()
     {
         // Arrange
         var testingServiceScope = new TestingServiceScope();
@@ -106,8 +108,8 @@ public class FilterParsingRegressionTests : TestBase
         var notInPeople = await queryablePeople.ApplyQueryKitFilter(notInInput).ToListAsync();
 
         // Assert
-        inPeople.Select(x => x.Id).Should().Equal(fakePersonTwo.Id);
-        notInPeople.Select(x => x.Id).Should().Equal(fakePersonOne.Id);
+        inPeople.Select(x => x.Id).Should().Equal(fakePersonOne.Id);
+        notInPeople.Select(x => x.Id).Should().Equal(fakePersonTwo.Id);
     }
 
     [Theory]
@@ -143,11 +145,10 @@ public class FilterParsingRegressionTests : TestBase
 
     [Theory]
     [InlineData("SpecificDateTime == 2024-01-15T08:00:00.500Z", true)]
-    [InlineData("SpecificDateTime == 2024-01-15T08:00:00Z.5", true)]
     [InlineData("SpecificDate == 2024-01-15T10:00:00.5+02:00", true)]
     [InlineData("Time == 08:30:00.5", true)]
     [InlineData("Time == \"08:30:00.500\"", true)]
-    [InlineData("Time == \"08:30:00.5\"", false)]
+    [InlineData("Time == \"08:30:00.5\"", true)]
     public async Task fractional_second_value_matches_by_its_fraction(string valueFilter, bool expectFractionPerson)
     {
         // Arrange
@@ -242,7 +243,7 @@ public class FilterParsingRegressionTests : TestBase
     }
 
     [Fact]
-    public async Task comparison_operator_factory_with_uses_all_matches_any_item()
+    public async Task comparison_operator_factory_with_uses_all_matches_every_item()
     {
         // Arrange
         var testingServiceScope = new TestingServiceScope();
@@ -269,7 +270,7 @@ public class FilterParsingRegressionTests : TestBase
             .ToListAsync();
 
         // Assert
-        recipes.Select(x => x.Id).Should().BeEquivalentTo(new[] { fakeRecipeOne.Id, fakeRecipeTwo.Id });
+        recipes.Select(x => x.Id).Should().Equal(fakeRecipeOne.Id);
     }
 
     [Fact]
@@ -301,9 +302,12 @@ public class FilterParsingRegressionTests : TestBase
 
     [Theory]
     [InlineData("""Tags ^$ "sweet" """, new[] { "pancakes" })]
+    [InlineData("""Tags !^$ "sweet" """, new[] { "stew", "bread", "water" })]
     [InlineData("""Tags ^$* "WINNER" """, new[] { "bread" })]
+    [InlineData("""Tags !^$* "WINNER" """, new[] { "pancakes", "stew", "water" })]
     [InlineData("""Tags %^$ "dinner" """, new[] { "stew", "water" })]
-    public async Task has_returns_matching_rows(string input, string[] expectedTitles)
+    [InlineData("""Tags %!^$ "dinner" """, new[] { "pancakes", "bread" })]
+    public async Task has_and_does_not_have_return_matching_rows(string input, string[] expectedTitles)
     {
         // Arrange
         var testingServiceScope = new TestingServiceScope();
@@ -323,5 +327,70 @@ public class FilterParsingRegressionTests : TestBase
 
         // Assert
         recipes.Select(x => x.Title[prefix.Length..]).Should().BeEquivalentTo(expectedTitles);
+    }
+
+    [Fact]
+    public void string_operator_with_null_value_throws_querykit_exception()
+    {
+        // Arrange
+        var testingServiceScope = new TestingServiceScope();
+        var queryablePeople = testingServiceScope.DbContext().People;
+
+        // Act
+        var act = () => queryablePeople.ApplyQueryKitFilter("Title @= null");
+
+        // Assert
+        act.Should().Throw<QueryKitParsingException>();
+    }
+
+    [Theory]
+    [InlineData("""Age == "abc" """)]
+    [InlineData("""Age == abc""")]
+    [InlineData("""Rating > "abc" """)]
+    [InlineData("""Rating > abc""")]
+    [InlineData("""BirthMonth ^^ ["Bogus"]""")]
+    [InlineData("""BirthMonth ^^ [Bogus]""")]
+    public async Task invalid_value_throws_parsing_exception(string input)
+    {
+        // Arrange
+        var testingServiceScope = new TestingServiceScope();
+
+        // Act
+        var queryablePeople = testingServiceScope.DbContext().People;
+        var act = async () => await queryablePeople.ApplyQueryKitFilter(input).ToListAsync();
+
+        // Assert
+        await act.Should().ThrowAsync<ParsingException>();
+    }
+
+    [Fact]
+    public async Task custom_operation_keeps_quoted_value_as_string()
+    {
+        // Arrange
+        var testingServiceScope = new TestingServiceScope();
+        var firstName = $"custom op {Guid.NewGuid()}";
+        var fakePersonOne = new FakeTestingPersonBuilder()
+            .WithFirstName(firstName)
+            .WithTitle("001")
+            .Build();
+        var fakePersonTwo = new FakeTestingPersonBuilder()
+            .WithFirstName(firstName)
+            .WithTitle("1")
+            .Build();
+        await testingServiceScope.InsertAsync(fakePersonOne, fakePersonTwo);
+
+        var input = $"""titleIs == "001" && {nameof(TestingPerson.FirstName)} == "{firstName}" """;
+        var config = new QueryKitConfiguration(config =>
+        {
+            config.CustomOperation<TestingPerson>((x, op, value) => x.Title == (string)value)
+                .HasQueryName("titleIs");
+        });
+
+        // Act
+        var queryablePeople = testingServiceScope.DbContext().People;
+        var people = await queryablePeople.ApplyQueryKitFilter(input, config).ToListAsync();
+
+        // Assert
+        people.Select(x => x.Id).Should().Equal(fakePersonOne.Id);
     }
 }

@@ -3,6 +3,7 @@ namespace QueryKit.UnitTests;
 using System.Globalization;
 using System.Linq.Expressions;
 using System.Reflection;
+using Configuration;
 using Exceptions;
 using FluentAssertions;
 using Operators;
@@ -28,21 +29,12 @@ public class FilterParsingRegressionTests
     [Theory]
     [InlineData("de-DE")]
     [InlineData("fr-FR")]
-    public void decimal_value_with_culture_decimal_comma_is_read_as_before(string cultureName)
+    [InlineData("en-US")]
+    public void decimal_value_with_decimal_comma_is_not_accepted(string cultureName)
     {
         var input = """Rating > 4,5""";
 
-        var filterExpression = WithCulture(cultureName, () => FilterParser.ParseFilter<TestingPerson>(input));
-
-        filterExpression.ToDisplayString().Should().Be("x => (x.Rating > 45)");
-    }
-
-    [Fact]
-    public void decimal_value_with_decimal_comma_is_not_accepted_in_a_culture_with_decimal_point()
-    {
-        var input = """Rating > 4,5""";
-
-        var act = () => WithCulture("en-US", () => FilterParser.ParseFilter<TestingPerson>(input));
+        var act = () => WithCulture(cultureName, () => FilterParser.ParseFilter<TestingPerson>(input));
 
         act.Should().Throw<QueryKitException>();
     }
@@ -95,12 +87,13 @@ public class FilterParsingRegressionTests
     }
 
     [Theory]
-    [InlineData("Title ^^ [\"Warm, with syrup\", \"a\\b\"]", new[] { "Warm", "with syrup", "a\\b" })]
-    [InlineData("Title !^^ [\"Warm, with syrup\", \"a\\b\"]", new[] { "Warm, with syrup" })]
-    [InlineData("Title ^^* [\"WARM, WITH SYRUP\"]", new[] { "Warm", "with syrup" })]
-    [InlineData("Title ^^ [\"\"\"Warm, with syrup\"\"\", \"Warm\"]", new[] { "Warm", "with syrup" })]
+    [InlineData("Title ^^ [\"Warm, with syrup\", \"a\\b\"]", new[] { "Warm, with syrup", "a\\b" })]
+    [InlineData("Title !^^ [\"Warm, with syrup\", \"a\\b\"]", new[] { "Warm", "with syrup" })]
+    [InlineData("Title ^^* [\"WARM, WITH SYRUP\"]", new[] { "Warm, with syrup" })]
+    [InlineData("Title ^^ [\"\"\"Warm, with syrup\"\"\", \"Warm\"]", new[] { "Warm, with syrup", "Warm" })]
     [InlineData("Title ^^ [\" Warm \", \"with syrup \"]", new[] { "Warm", "with syrup" })]
-    public void list_value_with_comma_is_split_into_items(string input, string[] expectedTitles)
+    [InlineData("Title !^^* [\"WARM, WITH SYRUP\"]", new[] { "Warm", "with syrup", "a\\b" })]
+    public void list_value_with_comma_is_one_item(string input, string[] expectedTitles)
     {
         var people = new[]
         {
@@ -113,6 +106,26 @@ public class FilterParsingRegressionTests
         var result = people.AsQueryable().ApplyQueryKitFilter(input).ToList();
 
         result.Select(x => x.Title).Should().BeEquivalentTo(expectedTitles);
+    }
+
+    [Theory]
+    [InlineData("tags ^^ [\"a\", \"b\", \"c\"]", "[a,b,c]")]
+    [InlineData("tags ^^ [a, b, c]", "[a,b,c]")]
+    [InlineData("tags ^^ [\"a\\b\"]", "[a\\b]")]
+    [InlineData("tags ^^ [\" a \", \"b\"]", "[ a ,b]")]
+    [InlineData("tags ^^ [\"Warm, with syrup\", \"Cold\"]", "[Warm, with syrup,Cold]")]
+    public void custom_operation_gets_list_text_without_escapes(string input, string expectedValue)
+    {
+        var config = new QueryKitConfiguration(config =>
+        {
+            config.CustomOperation<TestingPerson>((x, op, value) => x.Title == (string)value).HasQueryName("tags");
+        });
+
+        var expression = FilterParser.ParseFilter<TestingPerson>(input, config);
+        var invocation = (InvocationExpression)expression.Body;
+        var received = ((ConstantExpression)invocation.Arguments[2]).Value;
+
+        received.Should().Be(expectedValue);
     }
 
     [Fact]
@@ -137,10 +150,10 @@ public class FilterParsingRegressionTests
     [InlineData("SpecificDateTime ^^ [2024-01-15T08:00:00.5Z]")]
     [InlineData("SpecificDate == 2024-01-15T10:00:00.5+02:00")]
     [InlineData("SpecificDate == 2024-01-15T08:00:00.5000000Z")]
-    [InlineData("SpecificDateTime == 2024-01-15T08:00:00Z.5")]
-    [InlineData("SpecificDate == 2024-01-15T10:00:00+02:00.500")]
     [InlineData("Time == 08:30:00.5")]
     [InlineData("Time == \"08:30:00.500\"")]
+    [InlineData("Time == \"08:30:00.5\"")]
+    [InlineData("Time == \"08:30:00.50\"")]
     [InlineData("Time ^^ [08:30:00.5]")]
     public void fractional_seconds_are_kept(string input)
     {
@@ -150,13 +163,13 @@ public class FilterParsingRegressionTests
     }
 
     [Theory]
-    [InlineData("Time == \"08:30:00.5\"")]
-    [InlineData("Time == \"08:30:00.50\"")]
-    public void quoted_time_with_fewer_than_three_fraction_digits_drops_the_fraction(string input)
+    [InlineData("SpecificDateTime == 2024-01-15T08:00:00Z.5")]
+    [InlineData("SpecificDate == 2024-01-15T10:00:00+02:00.500")]
+    public void zone_before_the_fraction_throws(string input)
     {
-        var result = FractionalSecondPeople().AsQueryable().ApplyQueryKitFilter(input).ToList();
+        var act = () => FilterParser.ParseFilter<TestingPerson>(input);
 
-        result.Select(x => x.Title).Should().Equal("whole second");
+        act.Should().Throw<ParsingException>();
     }
 
     private static TestingPerson[] FractionalSecondPeople() => new[]
@@ -204,13 +217,13 @@ public class FilterParsingRegressionTests
     }
 
     [Theory]
-    [InlineData("""Title @= "am" """)]
-    [InlineData("""Title _= "la" """)]
-    [InlineData("""Title _-= "mb" """)]
-    [InlineData("""Title !@= "am" """)]
-    [InlineData("""Title !_= "la" """)]
-    [InlineData("""Title !_-= "mb" """)]
-    public void case_sensitive_string_operator_on_null_property_throws_in_memory(string input)
+    [InlineData("""Title @= "am" """, new[] { "lamb" })]
+    [InlineData("""Title _= "la" """, new[] { "lamb" })]
+    [InlineData("""Title _-= "mb" """, new[] { "lamb" })]
+    [InlineData("""Title !@= "am" """, new[] { "null", "other" })]
+    [InlineData("""Title !_= "la" """, new[] { "null", "other" })]
+    [InlineData("""Title !_-= "mb" """, new[] { "null", "other" })]
+    public void case_sensitive_string_operator_handles_null_property(string input, string[] expectedFirstNames)
     {
         var people = new[]
         {
@@ -219,9 +232,9 @@ public class FilterParsingRegressionTests
             new TestingPerson { Title = "other", FirstName = "other" },
         };
 
-        var act = () => people.AsQueryable().ApplyQueryKitFilter(input).ToList();
+        var result = people.AsQueryable().ApplyQueryKitFilter(input).ToList();
 
-        act.Should().Throw<NullReferenceException>();
+        result.Select(x => x.FirstName).Should().Equal(expectedFirstNames);
     }
 
     public static IEnumerable<object[]> ComparisonOperatorFactories() =>
@@ -232,13 +245,13 @@ public class FilterParsingRegressionTests
 
     [Theory]
     [MemberData(nameof(ComparisonOperatorFactories))]
-    public void comparison_operator_factory_ignores_uses_all(string factoryName)
+    public void comparison_operator_factory_keeps_uses_all(string factoryName)
     {
         var factory = typeof(ComparisonOperator).GetMethod(factoryName, BindingFlags.Public | BindingFlags.Static)!;
 
         var comparisonOperator = (ComparisonOperator)factory.Invoke(null, new object[] { true, true })!;
 
-        comparisonOperator.UsesAll.Should().BeFalse();
+        comparisonOperator.UsesAll.Should().BeTrue();
         comparisonOperator.CaseInsensitive.Should().BeTrue();
     }
 
@@ -269,7 +282,7 @@ public class FilterParsingRegressionTests
     }
 
     [Fact]
-    public void comparison_operator_factory_with_uses_all_builds_any_expression()
+    public void comparison_operator_factory_with_uses_all_builds_all_expression()
     {
         Expression<Func<Recipe, IEnumerable<string>>> ingredientNames = x => x.Ingredients.Select(y => y.Name);
 
@@ -278,7 +291,7 @@ public class FilterParsingRegressionTests
         var filterExpression = Expression.Lambda<Func<Recipe, bool>>(body, ingredientNames.Parameters);
 
         filterExpression.ToDisplayString().Should()
-            .Be(FilterParser.ParseFilter<Recipe>("""Ingredients.Name == "waffle" """).ToDisplayString());
+            .Be(FilterParser.ParseFilter<Recipe>("""Ingredients.Name %== "waffle" """).ToDisplayString());
     }
 
     [Theory]
@@ -300,9 +313,12 @@ public class FilterParsingRegressionTests
 
     [Theory]
     [InlineData("""Tags ^$ "sweet" """, new[] { "pancakes" })]
+    [InlineData("""Tags !^$ "sweet" """, new[] { "stew", "bread", "water" })]
     [InlineData("""Tags ^$* "WINNER" """, new[] { "bread" })]
+    [InlineData("""Tags !^$* "WINNER" """, new[] { "pancakes", "stew", "water" })]
     [InlineData("""Tags %^$ "dinner" """, new[] { "stew", "water" })]
-    public void has_returns_matching_rows(string input, string[] expectedTitles)
+    [InlineData("""Tags %!^$ "dinner" """, new[] { "pancakes", "bread" })]
+    public void has_and_does_not_have_return_matching_rows(string input, string[] expectedTitles)
     {
         var recipes = new[]
         {
@@ -340,6 +356,141 @@ public class FilterParsingRegressionTests
 
         filterExpression.ToDisplayString().Should().Be(expectedExpression.ToDisplayString());
         result.Should().Equal(expectedResult);
+    }
+
+    [Fact]
+    public void unknown_logical_operator_throws_query_kit_parsing_exception()
+    {
+        var act = () => LogicalOperator.GetByOperatorString("xor");
+
+        act.Should().Throw<QueryKitParsingException>().WithMessage("Operator xor is not supported");
+    }
+
+    [Theory]
+    [InlineData("Age sideways")]
+    [InlineData("Title, Age up")]
+    public void invalid_sort_direction_throws_query_kit_parsing_exception(string input)
+    {
+        var act = () => SortParser.ParseSort<TestingPerson>(input);
+
+        act.Should().Throw<QueryKitParsingException>().WithMessage("Invalid direction: *");
+    }
+
+    [Theory]
+    [InlineData("Title @= null")]
+    [InlineData("Title _= null")]
+    [InlineData("Title _-= null")]
+    [InlineData("Title !@= null")]
+    [InlineData("Title !_= null")]
+    [InlineData("Title !_-= null")]
+    [InlineData("Title @=* null")]
+    [InlineData("Title !_-=* null")]
+    public void string_operator_with_null_value_throws_querykit_exception(string input)
+    {
+        var act = () => FilterParser.ParseFilter<TestingPerson>(input);
+
+        act.Should().Throw<QueryKitParsingException>();
+    }
+
+    [Theory]
+    [InlineData("""Age == "abc" """)]
+    [InlineData("""Age == abc""")]
+    [InlineData("""Rating > "abc" """)]
+    [InlineData("""Rating > abc""")]
+    [InlineData("""Age == 99999999999""")]
+    [InlineData("""Id == "abc" """)]
+    [InlineData("""SpecificDateTime == "abc" """)]
+    [InlineData("""Favorite == "abc" """)]
+    [InlineData("""Age ^^ ["abc"]""")]
+    [InlineData("""BirthMonth == "Bogus" """)]
+    [InlineData("""BirthMonth ^^ ["Bogus"]""")]
+    [InlineData("""BirthMonth ^^ [Bogus]""")]
+    public void invalid_value_throws_parsing_exception(string input)
+    {
+        var act = () => FilterParser.ParseFilter<TestingPerson>(input);
+
+        act.Should().Throw<ParsingException>();
+    }
+
+    [Theory]
+    [InlineData("""BirthMonth ^^ ["Bogus"]""", "Bogus", "BirthMonthEnum", "BirthMonth")]
+    [InlineData("""BirthMonth ^^ [Bogus]""", "Bogus", "BirthMonthEnum", "BirthMonth")]
+    [InlineData("""BirthMonth ^^ [January, Bogus]""", "Bogus", "BirthMonthEnum", "BirthMonth")]
+    [InlineData("""BirthMonth == "Bogus" """, "Bogus", "BirthMonthEnum", "BirthMonth")]
+    [InlineData("""BirthMonth == Bogus""", "Bogus", "BirthMonthEnum", "BirthMonth")]
+    [InlineData("""Age == "abc" """, "abc", "Int32", "Age")]
+    [InlineData("""Age == 99999999999""", "99999999999", "Int32", "Age")]
+    [InlineData("""Age ^^ [1, abc]""", "abc", "Int32", "Age")]
+    [InlineData("""Rating > abc""", "abc", "Decimal", "Rating")]
+    [InlineData("""Id == "abc" """, "abc", "Guid", "Id")]
+    [InlineData("""SpecificDateTime == "abc" """, "abc", "DateTime", "SpecificDateTime")]
+    [InlineData("""Favorite == "abc" """, "abc", "Boolean", "Favorite")]
+    public void invalid_value_message_names_the_value_the_type_and_the_property(string input, string value, string type, string property)
+    {
+        var act = () => FilterParser.ParseFilter<TestingPerson>(input);
+
+        act.Should().ThrowExactly<ParsingException>()
+            .WithMessage($"The value '{value}' is not a valid {type} for the filter property '{property}'.");
+    }
+
+    [Fact]
+    public void invalid_value_message_names_the_query_name()
+    {
+        var config = new QueryKitConfiguration(settings =>
+        {
+            settings.Property<TestingPerson>(x => x.BirthMonth!).HasQueryName("month");
+        });
+
+        var act = () => FilterParser.ParseFilter<TestingPerson>("""month ^^ ["Bogus"]""", config);
+
+        act.Should().ThrowExactly<ParsingException>()
+            .WithMessage("The value 'Bogus' is not a valid BirthMonthEnum for the filter property 'month'.")
+            .WithInnerExceptionExactly<ArgumentException>();
+    }
+
+    [Theory]
+    [InlineData("""titleIs == "123" """, "123")]
+    [InlineData("""titleIs == "4.5" """, "4.5")]
+    [InlineData("""titleIs == "true" """, "true")]
+    [InlineData("""titleIs == "null" """, "null")]
+    [InlineData("""titleIs == "" """, "")]
+    public void custom_operation_keeps_quoted_value_as_string(string input, string expectedTitle)
+    {
+        var people = new[] { "123", "4.5", "true", "null", "", "other" }
+            .Select(title => new TestingPerson { Title = title })
+            .ToArray();
+        var config = new QueryKitConfiguration(config =>
+        {
+            config.CustomOperation<TestingPerson>((x, op, value) => x.Title == (string)value)
+                .HasQueryName("titleIs");
+        });
+
+        var result = people.AsQueryable().ApplyQueryKitFilter(input, config).ToList();
+
+        result.Select(x => x.Title).Should().Equal(expectedTitle);
+    }
+
+    [Fact]
+    public void custom_operation_converts_unquoted_number_and_quoted_date()
+    {
+        var people = new[]
+        {
+            new TestingPerson { Title = "match", Age = 30, SpecificDateTime = new DateTime(2024, 1, 15, 8, 0, 0, DateTimeKind.Utc) },
+            new TestingPerson { Title = "other", Age = 31, SpecificDateTime = new DateTime(2024, 1, 15, 9, 0, 0, DateTimeKind.Utc) },
+        };
+        var config = new QueryKitConfiguration(config =>
+        {
+            config.CustomOperation<TestingPerson>((x, op, value) => x.Age == (int)value)
+                .HasQueryName("ageIs");
+            config.CustomOperation<TestingPerson>((x, op, value) => x.SpecificDateTime == (DateTime)value)
+                .HasQueryName("createdAt");
+        });
+
+        var result = people.AsQueryable()
+            .ApplyQueryKitFilter("""ageIs == 30 && createdAt == "2024-01-15T08:00:00Z" """, config)
+            .ToList();
+
+        result.Select(x => x.Title).Should().Equal("match");
     }
 
     private static TResult WithCulture<TResult>(string cultureName, Func<TResult> action)

@@ -120,6 +120,8 @@ Here's an example for the `in` operator:
 var input = """(Age ^^ [20, 30, 40]) && (BirthMonth ^^* ["January", "February", "March"]) || (Id ^^ ["6d623e92-d2cf-4496-a2df-f49fa77328ee"])""";
 ```
 
+A quoted list item can hold a comma. For example, `Title ^^ ["Warm, with syrup", "Cold"]` has two items: `Warm, with syrup` and `Cold`.
+
 ### Property List Grouping
 
 Property list grouping allows you to apply a single comparison operation across multiple properties, making it easy to search for a value in any of several fields without writing repetitive conditions.
@@ -251,6 +253,7 @@ Property list grouping is particularly useful for:
   * `DateOnly`: `var filterInput = """Birthday == "2022-07-01" """;`
   * `DateTimeOffset`: 
     * `var filterInput = """Birthday == "2022-07-01T00:00:03Z" """;` 
+    * QueryKit converts a `DateTimeOffset` value to UTC. `"2022-07-01T00:00:03+01:00"` becomes the same instant with offset 0: `2022-06-30T23:00:03Z`.
   * `DateTime`: `var filterInput = """Birthday == "2022-07-01" """;`
     * `var filterInput = """Birthday == "2022-07-01T00:00:03" """;` 
     * `var filterInput = """Birthday == "2022-07-01T00:00:03+01:00" """;` 
@@ -258,6 +261,8 @@ Property list grouping is particularly useful for:
   * `TimeOnly`: 
     * `var filterInput = """Time == "12:30:00" """;`
     * `var filterInput = """Time == "12:30:00.678722" """;`
+    * A time fraction keeps every digit. For example, `"12:30:00.5"` is 12:30:00 and 500 milliseconds.
+  * In a date and time value, write the zone after the fraction: `2022-07-01T00:00:03.5Z`. An unquoted value with the zone before the fraction (`2022-07-01T00:00:03Z.5`) throws a `ParsingException`.
 
 * `bool` properties need to use `== true`, `== false`, or the same using the `!=` operator. they can not be standalone properies: 
 
@@ -310,6 +315,8 @@ Child property comparisons work with:
 - **All Operators**: `==`, `!=`, `>`, `<`, `>=`, `<=`
 - **Type Conversion**: Automatic conversion between compatible types
 - **Complex Expressions**: Can be combined with logical operators and parentheses
+
+An unquoted dotted name on the right side is always a property path. If it does not resolve to a property, the filter throws `UnknownFilterPropertyException`. A path through a collection (`Ingredients.Name`) also throws. To compare with the literal text, quote it: `Title == "foo.bar"`.
 
 ### Arithmetic Expressions
 
@@ -380,6 +387,7 @@ var input = "((Revenue - Expenses) / Revenue) > 0.1";
 - **Parentheses**: Use parentheses to control calculation order and group expressions
 - **Entity Framework Translation**: All arithmetic expressions are translated to efficient SQL queries
 - **Property-to-Property**: Can mix property references with literal values in the same expression
+- **Unknown Properties**: An unknown property in an arithmetic expression throws `UnknownFilterPropertyException`, like any other filter property. When `AllowUnknownProperties` is `true`, QueryKit ignores the clause. Arithmetic supports only entity members, so a derived property or a custom operation name is unknown here
 
 #### Examples
 
@@ -565,7 +573,7 @@ public enum BirthMonthEnum
 Filtering is set up to create an expression using the property names you have on your entity, but you can pass in a config to customize things a bit when needed.
 
 * `HasQueryName()` to create a custom alias for a property. For exmaple, we can make `FirstName` aliased to `first`.
-* `PreventFilter()` to prevent filtering on a given property
+* `PreventFilter()` to prevent filtering on a given property. The setting applies in every place that a filter can use the property: the left side, the right side, arithmetic, and a property list, in any letter case. It also applies to derived properties and custom operations.
 
 ```c#
 var input = $"""first == "Jane" || Age > 10""";
@@ -577,6 +585,8 @@ var config = new QueryKitConfiguration(config =>
       		.PreventFilter();
 });
 ```
+
+You can use a query name on the left side of a comparison, in a property list, and in an arithmetic expression. For example, `(first, LastName) == "Jane"` compares `FirstName` and `LastName` with `Jane`. QueryKit does not change text inside a quoted value. For example, `LastName == "first == x"` compares `LastName` with the text `first == x`. A query name ignores case with the rules of the invariant culture, so `FIRST` matches `first` in every culture, also in `tr-TR`.
 
 #### Derived Properties
 
@@ -717,6 +727,8 @@ var filterExpression = FilterParser.ParseFilter<Recipe>(input, config);
 > `Title @@$ "titilating"` ✅ 
 > `Title@@$"titilating"` ❌
 
+QueryKit reads a custom operator only where an operator can stand. Operator text inside a quoted value does not change. For example, `Title eq "salt and pepper"` compares `Title` with `salt and pepper`.
+
 #### Allow Unknown Properties
 
 By default, QueryKit will throw an error if it doesn't recognize a property name, If you want to loosen the reigns here a bit, you can set `AllowUnknownProperties` to `true` in your config. When active, unknown properties will be ignored in the expression resolution.
@@ -787,12 +799,16 @@ var config = new QueryKitConfiguration(config =>
 // "Publisher.Address.City" throws (depth 2, exceeds global limit of 1)
 ```
 
+The override applies only to the property and the paths below it. For example, `HasMaxDepth` on `Address` does not apply to `AddressBackup.State`, so `AddressBackup.State` uses the global limit.
+
 **Depth Calculation:**
 - `Title` = depth 0 (root property)
 - `Author.Name` = depth 1 (one level of nesting)
 - `Author.Address.City` = depth 2 (two levels of nesting)
 
 Setting `MaxPropertyDepth = 0` only allows root-level properties. A `null` value (default) allows unlimited depth.
+
+The limit applies to every property path in a filter, also to a property path inside an arithmetic expression. For example, `(Author.Rating + 0) > 1` throws when `MaxPropertyDepth = 0`.
 
 #### Parameterize Filter Values
 
@@ -823,7 +839,7 @@ var filterExpression = FilterParser.ParseFilter<Recipe>(input, config);
 
 #### Parse Limits
 
-`IQueryKitParseLimits` caps how much a filter string can do, through `MaxInputLength` (a number of characters) and `MaxNestingDepth` (a number of levels of parentheses). Both limits are off by default. If your app sends user input to QueryKit, turn both limits on. A filter string with a few thousand nested parentheses can overflow the call stack and stop the process. `QueryKitConfiguration` implements this interface, so a custom configuration class can implement `IQueryKitParseLimits` directly instead. A filter string that goes over `MaxInputLength` throws a `QueryKitInputLengthExceededException` before parsing starts. A filter string that goes over `MaxNestingDepth` throws a `QueryKitNestingDepthExceededException` when the parser enters the group that goes over the limit. These limits apply only to filter strings. Sort strings have no limit, and the number of items in an in-list has no limit. The nesting depth counts each parenthesized group in the filter: a logical group, an arithmetic group, and a property list. A `(` or `)` inside a quoted value is part of the value, so it does not change the depth. `MaxNestingDepth` does not limit a long flat chain of `&&` or `||` clauses, and a very long chain can also overflow the call stack. Keep `MaxInputLength` small to limit such a chain.
+`IQueryKitParseLimits` caps how much a filter string can do, through `MaxInputLength` (a number of characters) and `MaxNestingDepth` (a number of levels of parentheses). Both limits are off by default. If your app sends user input to QueryKit, turn both limits on. A filter string with a few thousand nested parentheses can overflow the call stack and stop the process. `QueryKitConfiguration` implements this interface, so a custom configuration class can implement `IQueryKitParseLimits` directly instead. A filter string that goes over `MaxInputLength` throws a `QueryKitInputLengthExceededException` before parsing starts. A filter string that goes over `MaxNestingDepth` throws a `QueryKitNestingDepthExceededException` when the parser enters the group that goes over the limit. These limits apply only to filter strings. Sort strings have no limit, and the number of items in an in-list has no limit. The nesting depth counts each parenthesized group in the filter: a logical group, an arithmetic group, and a property list. A `(` or `)` inside a quoted value is part of the value, so it does not change the depth. `MaxNestingDepth` does not limit a long flat chain of `&&` or `||` clauses. QueryKit parses such a chain in a loop, so the parse does not overflow the call stack. But EF Core reads the expression tree with recursion, and a long flat chain can still overflow the stack there. EF Core overflowed at about 729 clauses on a 1 MB stack, 361 clauses on a 512 KB stack, and 177 clauses on a 256 KB stack. On a 512 KB stack, that was about 3,967 characters. On a 256 KB stack, it was about 1,943 characters. `MaxInputLength` is the only limit on a flat chain. If your app runs queries on threads with a small stack, for example in IIS in-process hosting, set `MaxInputLength`.
 
 ```csharp
 var config = new QueryKitConfiguration(config =>
@@ -933,6 +949,8 @@ var people = _dbContext.People
 
 This allows you to use `Email == "value"` syntax instead of `Email.Value == "value"` when the property is configured with HasConversion in EF Core. The `HasConversion<TTarget>()` method tells QueryKit what the conversion target type is so it can handle the type conversion properly.
 
+QueryKit finds the conversion by the property, with or without a query name. A `null` value, such as `email == null`, compares the property against null. A nullable struct property also uses the conversion. QueryKit reads a number, an enum, or a Guid by its own type, so `HasConversion<string>()` on these properties does not change the filter.
+
 > **Important:** When using `HasConversion` in EF Core, you MUST configure the property in QueryKit using `x => x.Email`, not `x => x.Email.Value`. The conversion is on the parent property, so pointing to the nested `.Value` property will cause EF Core translation errors. Use `x => x.Email.Value` only when using `ComplexProperty` or `OwnsOne` without HasConversion.
 
 ## Sorting
@@ -961,7 +979,7 @@ var input = "Title, -Age";
 Sorting is set up to create an expression using the property names you have on your entity, but you can pass in a config to customize things a bit when needed.
 
 * Just as with filtering, `HasQueryName()` to create a custom alias for a property. For exmaple, we can make `FirstName` aliased to `first`.
-* `PreventSort()` to prevent filtering on a given property
+* `PreventSort()` to prevent sorting on a given property. The setting applies in any letter case, also when the sort uses the member name of a property that has a query name. It also applies to derived properties.
 
 ```c#
 var input = "Age desc, first";

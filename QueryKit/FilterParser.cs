@@ -3,6 +3,7 @@
 using System.Globalization;
 using System.Linq.Expressions;
 using System.Reflection;
+using System.Text;
 using Configuration;
 using Exceptions;
 using Operators;
@@ -21,10 +22,6 @@ public static class FilterParser
     public static Expression<Func<T, bool>> ParseFilter<T>(string input, IQueryKitConfiguration? config = null)
     {
         EnsureWithinInputLength(input, config);
-
-        input = config?.ReplaceLogicalAliases(input) ?? input;
-        input = config?.ReplaceComparisonAliases(input) ?? input;
-        input = config?.PropertyMappings?.ReplaceAliasesWithPropertyPaths(input) ?? input;
         
         var parameter = Expression.Parameter(typeof(T), "x");
         Expression expr;
@@ -66,6 +63,14 @@ public static class FilterParser
             throw new ParsingException(e);
         }
         catch (ParseException e)
+        {
+            throw new ParsingException(e);
+        }
+        catch (FormatException e)
+        {
+            throw new ParsingException(e);
+        }
+        catch (OverflowException e)
         {
             throw new ParsingException(e);
         }
@@ -146,6 +151,52 @@ public static class FilterParser
     private static readonly Parser<string> IdentifierPathParser =
         Identifier.DelimitedBy(Parse.Char('.')).Select(parts => string.Join(".", parts));
 
+    // A property is a configured query name or a path of identifiers. Query names are matched in the grammar,
+    // so a query name can hold any text (e.g. `first-name`, `_first`, or `first name`) and text inside quoted values is never changed.
+    // Longer query names are tried first so a query name that starts with another query name (e.g. `first` and `first name`) still matches.
+    // Every query name ignores case with the rules of the invariant culture, so the result does not depend on the culture of the parse.
+    private static Parser<string> PropertyPathParser(IQueryKitConfiguration? config)
+    {
+        Parser<string> parser = i => Result.Failure<string>(i, "no query name", Array.Empty<string>());
+        var mappings = config?.PropertyMappings;
+        if (mappings != null)
+        {
+            var queryNames = mappings.PropertyQueryNames
+                .Concat(mappings.DerivedOrCustomOperationQueryNames)
+                .OrderByDescending(queryName => queryName.Length);
+            foreach (var queryName in queryNames)
+            {
+                parser = parser.Or(QueryName(queryName));
+            }
+        }
+
+        return parser.Or(IdentifierPathParser);
+    }
+
+    // A query name is a whole name: the next character can not continue a property path.
+    private static Parser<string> QueryName(string queryName) => input =>
+    {
+        var remainder = input;
+        foreach (var c in queryName)
+        {
+            if (remainder.AtEnd || char.ToLowerInvariant(remainder.Current) != char.ToLowerInvariant(c))
+            {
+                return Result.Failure<string>(input, $"Query name '{queryName}' expected", new[] { queryName });
+            }
+
+            remainder = remainder.Advance();
+        }
+
+        if (!remainder.AtEnd && IsPropertyPathChar(remainder.Current))
+        {
+            return Result.Failure<string>(input, $"Query name '{queryName}' must not be followed by '{remainder.Current}'", new[] { queryName });
+        }
+
+        return Result.Success(queryName, remainder);
+    };
+
+    private static bool IsPropertyPathChar(char c) => char.IsLetterOrDigit(c) || c == '_' || c == '.';
+
     private static Parser<IEnumerable<string>> PropertyListParser(Parser<string> propertyPathParser)
     {
         var propertiesParser = propertyPathParser.Token().DelimitedBy(Parse.Char(',').Token());
@@ -187,13 +238,12 @@ public static class FilterParser
 
     private static Parser<ComparisonOperator> ComparisonOperatorParser(IQueryKitConfiguration? config)
     {
-        var operatorParser = CanonicalComparisonOperatorParser.Or(ComparisonOperatorAliasParser(config));
+        var operatorParser = ComparisonOperatorAliasParser(config).Or(CanonicalComparisonOperatorParser);
         return Parse.Char(ComparisonOperator.AllPrefix).Optional().Select(opt => opt.IsDefined)
             .Then(hasHash => operatorParser.Select(x => ComparisonOperator.GetByOperatorString(x.Operator, x.CaseInsensitive, hasHash)));
     }
 
-    // The rewrite before the parse replaces each alias that stands between whitespace, like v1.14.2.
-    // The grammar reads an alias that the rewrite did not replace, for example `(Age)eq 3`.
+    // Aliases are matched in the grammar (not by rewriting the input) so text inside quoted values is never changed.
     // Longer aliases are tried first so an alias that starts with another alias (e.g. `@@$$` and `@@$`) still matches.
     private static Parser<(string Operator, bool CaseInsensitive)> ComparisonOperatorAliasParser(IQueryKitConfiguration? config)
     {
@@ -247,33 +297,15 @@ public static class FilterParser
     private static readonly Parser<string> DateTimeTimeParser = Parse.Regex(@"T\d{2}:\d{2}:\d{2}").Text().Optional().Select(x => x.GetOrElse(""));
     private static readonly Parser<string> DateTimeMicrosParser = Parse.Regex(@"\.\d{1,7}").Text().Optional().Select(x => x.GetOrElse(""));
     private static readonly Parser<string> DateTimeZoneParser = Parse.Regex(@"Z|[+-]\d{2}(:\d{2})?").Text().Optional().Select(x => x.GetOrElse(""));
-    // v1.14.2 read the zone before the fraction, so 2022-07-01T00:00:02Z.5 is a valid value. A zone after the fraction is also valid.
     private static readonly Parser<string> DateTimeFormatParser =
         from dateFormat in Parse.Regex(@"\d{4}-\d{2}-\d{2}").Text()
         from timeFormat in DateTimeTimeParser
-        from zoneBeforeMicros in DateTimeZoneParser
         from micros in DateTimeMicrosParser
-        from zoneAfterMicros in zoneBeforeMicros == "" ? DateTimeZoneParser : Parse.Return("")
-        select dateFormat + timeFormat + micros + zoneBeforeMicros + zoneAfterMicros;
+        from timeZone in DateTimeZoneParser
+        select dateFormat + timeFormat + micros + timeZone;
 
-    // A number with a '.' decimal point, or with the decimal separator of the current culture.
-    // The longer match wins, so '4.5' parses in every culture and '4,5' still parses in a culture that uses ','.
-    private static readonly Parser<string> UnsignedNumberParser = input =>
-    {
-        var invariant = Parse.DecimalInvariant(input);
-        var culture = Parse.Decimal(input);
-        return culture.WasSuccessful && (!invariant.WasSuccessful || culture.Remainder.Position > invariant.Remainder.Position)
-            ? culture
-            : invariant;
-    };
-
+    // A number always uses the '.' decimal point, so a filter has the same meaning in every culture.
     private static readonly Parser<string> NumberParser =
-        from sign in Parse.Char('-').Optional().Select(x => x.IsDefined ? "-" : "")
-        from number in UnsignedNumberParser
-        select sign + number;
-
-    // List items are separated by ',', so a list number always uses the '.' decimal point.
-    private static readonly Parser<string> ListNumberParser =
         from sign in Parse.Char('-').Optional().Select(x => x.IsDefined ? "-" : "")
         from number in Parse.DecimalInvariant
         select sign + number;
@@ -319,6 +351,12 @@ public static class FilterParser
                 buildClause(cultureNumberPrefix);
             }
 
+            // A value that does not convert already has a ParsingException that names the value.
+            if (exception is ParsingException)
+            {
+                throw;
+            }
+
             throw new ParsingException(exception);
         }
     }
@@ -336,7 +374,8 @@ public static class FilterParser
     // This is needed to disambiguate a literal from a bare property reference (property-to-property
     // comparison) once the surrounding quotes have been stripped, since both are otherwise identical strings.
     // CultureNumberPrefix is set when the value holds a number that only the '.' decimal point reads (see BuildClauseLikeV1142).
-    private readonly record struct RightSideValue(string Value, bool IsQuotedLiteral, string? CultureNumberPrefix = null);
+    // IsPropertyPath is set for unquoted identifiers joined with '.', which must resolve to a property path.
+    private readonly record struct RightSideValue(string Value, bool IsQuotedLiteral, string? CultureNumberPrefix = null, bool IsPropertyPath = false);
 
     private static readonly Parser<IEnumerable<(string Value, bool IsDotOnlyNumber)>> SquareBracketValuesParser =
         Parse.String("null").Text()
@@ -344,7 +383,7 @@ public static class FilterParser
             .Or(DateTimeFormatParser)
             .Or(TimeFormatParser)
             .Select(v => (v, false))
-            .Or(ListNumberParser.Select(v => (v, CultureNumberPrefix(v) != null)))
+            .Or(NumberParser.Select(v => (v, CultureNumberPrefix(v) != null)))
             .Or(RawStringLiteralParser.Or(DoubleQuoteParser).Or(Identifier).Select(v => (v, false)))
             .DelimitedBy(Parse.Char(',').Token());
 
@@ -353,8 +392,51 @@ public static class FilterParser
         from openingBracket in Parse.Char('[')
         from content in SquareBracketValuesParser
         from closingBracket in Parse.Char(']')
-        select new RightSideValue("[" + string.Join(",", content.Select(x => x.Value)) + "]", false,
+        select new RightSideValue("[" + string.Join(",", content.Select(x => EscapeListItem(x.Value))) + "]", false,
             content.Any(x => x.IsDotOnlyNumber) ? "" : null);
+
+    // List items are joined with ',' so quoted items that contain ',' or '\' are escaped and split back with SplitListItems, which trims each item
+    private static string EscapeListItem(string item)
+        => item.Replace(@"\", @"\\").Replace(",", @"\,");
+
+    private static string UnescapeListText(string list)
+    {
+        var text = new StringBuilder(list.Length);
+        for (var i = 0; i < list.Length; i++)
+        {
+            if (list[i] == '\\' && i + 1 < list.Length)
+                i++;
+            text.Append(list[i]);
+        }
+
+        return text.ToString();
+    }
+
+    private static List<string> SplitListItems(string list)
+    {
+        var items = new List<string>();
+        var current = new StringBuilder();
+        var content = list.Substring(1, list.Length - 2);
+        for (var i = 0; i < content.Length; i++)
+        {
+            if (content[i] == '\\' && i + 1 < content.Length)
+            {
+                current.Append(content[++i]);
+            }
+            else if (content[i] == ',')
+            {
+                items.Add(current.ToString().Trim());
+                current.Clear();
+            }
+            else
+            {
+                current.Append(content[i]);
+            }
+        }
+        items.Add(current.ToString().Trim());
+
+        return items;
+    }
 
     private static readonly Parser<RightSideValue> RightSideValueChoiceParser =
         Parse.String("null").Text().Select(v => new RightSideValue(v, false))
@@ -364,7 +446,7 @@ public static class FilterParser
             .XOr(NumberParser.Select(v => new RightSideValue(v, false, CultureNumberPrefix(v))))
             .XOr((RawStringLiteralParser.Or(DoubleQuoteParser)).Select(v => new RightSideValue(v, true)))
             .XOr(SquareBracketParser)
-            .XOr(Identifier.Select(v => new RightSideValue(v, false))); // Keep this last to try property paths only if nothing else matches
+            .XOr(Identifier.DelimitedBy(Parse.Char('.')).Select(v => v.ToList()).Select(v => new RightSideValue(string.Join(".", v), false, IsPropertyPath: v.Count > 1))); // Keep this last to try property paths only if nothing else matches
 
     private static readonly Parser<RightSideValue> RightSideValueParser =
         from atSign in Parse.Char('@').Optional()
@@ -429,11 +511,6 @@ public static class FilterParser
                 select LogicalOperator.GetByOperatorString(match.Operator)));
     }
 
-    // Npgsql only accepts a DateTimeOffset parameter with offset 0, so a parameter gets the same instant in UTC.
-    // A literal keeps its offset, like v1.14.2.
-    private static DateTimeOffset ToParameterOffset(DateTimeOffset value)
-        => FilterValue.Parameterize ? value.ToUniversalTime() : value;
-
     private static readonly Dictionary<Type, Func<string, object>> TypeConversionFunctions = new()
     {
         { typeof(string), value => value },
@@ -448,9 +525,9 @@ public static class FilterParser
         { typeof(short), value => short.Parse(value, CultureInfo.InvariantCulture) },
         { typeof(byte), value => byte.Parse(value, CultureInfo.InvariantCulture) },
         { typeof(DateTime), value => DateTime.Parse(value, CultureInfo.InvariantCulture, DateTimeStyles.AdjustToUniversal) },
-        { typeof(DateTimeOffset), value => ToParameterOffset(DateTimeOffset.Parse(value)) },
-        { typeof(DateOnly), value => DateOnly.Parse(value) },
-        { typeof(TimeOnly), value => TimeOnly.Parse(value) },
+        { typeof(DateTimeOffset), value => DateTimeOffset.Parse(value, CultureInfo.InvariantCulture).ToUniversalTime() },
+        { typeof(DateOnly), value => DateOnly.Parse(value, CultureInfo.InvariantCulture) },
+        { typeof(TimeOnly), value => TimeOnly.Parse(value, CultureInfo.InvariantCulture) },
         { typeof(TimeSpan), value => TimeSpan.Parse(value) },
         { typeof(uint), value => uint.Parse(value, CultureInfo.InvariantCulture) },
         { typeof(ulong), value => ulong.Parse(value, CultureInfo.InvariantCulture) },
@@ -458,8 +535,23 @@ public static class FilterParser
         { typeof(sbyte), value => sbyte.Parse(value, CultureInfo.InvariantCulture) },
     };
 
+    // A value that does not convert to the property type throws ParsingException with the value, the type, and the
+    // property name as the caller wrote it (the query name, not the member path).
     private static Expression CreateRightExpr(Expression leftExpr, string right, bool rightIsQuotedLiteral, ComparisonOperator op,
-        IQueryKitConfiguration? config = null, string? propertyPath = null, string? memberPath = null)
+        string propertyName, IQueryKitConfiguration? config = null, string? propertyPath = null)
+    {
+        try
+        {
+            return CreateRightExprForProperty(leftExpr, right, rightIsQuotedLiteral, op, config, propertyPath);
+        }
+        catch (InvalidFilterValueException e)
+        {
+            throw new ParsingException(e.Value, propertyName, e.TargetType, e.InnerException!);
+        }
+    }
+
+    private static Expression CreateRightExprForProperty(Expression leftExpr, string right, bool rightIsQuotedLiteral, ComparisonOperator op,
+        IQueryKitConfiguration? config, string? propertyPath)
     {
         var targetType = leftExpr.Type;
 
@@ -507,10 +599,18 @@ public static class FilterParser
             }
         }
 
-        // Check if this property uses HasConversion
-        if (config?.PropertyMappings != null && !string.IsNullOrEmpty(propertyPath))
+        // == null and != null on a collection property compare the property with null. On a nested path (a Select), they compare each element with null.
+        if (right == "null" && !rightIsQuotedLiteral && leftExpr is MemberExpression && targetType.IsCollection()
+            && (op.Name == ComparisonOperator.EqualsOperator().Name || op.Name == ComparisonOperator.NotEqualsOperator().Name))
         {
-            var propertyConfig = config.PropertyMappings.GetPropertyInfoByQueryName(propertyPath);
+            return Expression.Constant(null, targetType);
+        }
+
+        // Check if this property uses HasConversion. QueryKit reads a type that it knows (a number, an enum, a Guid) by its own type,
+        // like v1.14.2 did for a property with a query name, so the conversion applies only to a type that it can not read.
+        if (config?.PropertyMappings != null && !string.IsNullOrEmpty(propertyPath) && !CanCreateRightExprFromType(targetType))
+        {
+            var propertyConfig = config.PropertyMappings.GetPropertyInfo(propertyPath);
             if (propertyConfig?.UsesConversion == true && propertyConfig.ConversionTargetType != null)
             {
                 // For HasConversion properties, try to create a constant of the original type
@@ -523,35 +623,24 @@ public static class FilterParser
                         return arrayExpr;
                     }
 
-                    var stringCtor = leftExpr.Type.GetConstructor(new[] { typeof(string) });
-                    if (stringCtor != null)
+                    // A null literal compares against null instead of being passed to the constructor
+                    var underlyingType = Nullable.GetUnderlyingType(leftExpr.Type);
+                    if (right == "null" && (!leftExpr.Type.IsValueType || underlyingType != null))
                     {
-                        return Expression.New(stringCtor, FilterValue.Create(right, typeof(string)));
+                        return Expression.Constant(null, leftExpr.Type);
                     }
 
-                    // v1.14.2 compared a nullable struct with a string here and threw, so construct the underlying type instead.
-                    // A null literal keeps the v1.14.2 result.
-                    if (right != "null" && CreateStringConversionRightExpr(leftExpr.Type, right) is { } nullableStructExpr)
+                    // Nullable structs are constructed from their underlying type, then converted back
+                    var stringCtor = (underlyingType ?? leftExpr.Type).GetConstructor(new[] { typeof(string) });
+                    if (stringCtor != null)
                     {
-                        return nullableStructExpr;
+                        Expression constructed = Expression.New(stringCtor, FilterValue.Create(right, typeof(string)));
+                        return underlyingType == null ? constructed : Expression.Convert(constructed, leftExpr.Type);
                     }
                 }
 
                 // For other conversion types, fall back to using the conversion target type
                 targetType = propertyConfig.ConversionTargetType;
-            }
-            else if (!CanCreateRightExprFromType(targetType) &&
-                     config.PropertyMappings.GetPropertyInfo(memberPath ?? propertyPath) is { UsesConversion: true } pathConfig &&
-                     pathConfig.ConversionTargetType == typeof(string))
-            {
-                // The lookup by query name above misses a property with a different query name. v1.14.2 then threw,
-                // because it can not read a value of this type, so find the conversion by the property path instead.
-                if (IsArrayLiteral(right) && CreateStringConversionArrayExpr(leftExpr.Type, right) is { } pathArrayExpr)
-                {
-                    return pathArrayExpr;
-                }
-
-                return CreateStringConversionRightExpr(leftExpr.Type, right) ?? CreateRightExprFromType(targetType, right, rightIsQuotedLiteral, op);
             }
         }
 
@@ -572,10 +661,7 @@ public static class FilterParser
             return null;
         }
 
-        var body = right.Substring(1, right.Length - 2);
-        var items = body.Length == 0
-            ? Array.Empty<string>()
-            : body.Split(',').Select(x => x.Trim()).ToArray();
+        var items = right.Length == 2 ? new List<string>() : SplitListItems(right);
 
         var constants = items.Select(item =>
         {
@@ -595,44 +681,24 @@ public static class FilterParser
         return Expression.NewArrayInit(leftType, constants);
     }
 
-    // Builds the right side for a property with HasConversion<string>() from a constructor that takes a string.
-    // A null literal compares against null, and a nullable struct is constructed from its underlying type.
-    private static Expression? CreateStringConversionRightExpr(Type leftType, string right)
-    {
-        var underlyingType = Nullable.GetUnderlyingType(leftType);
-        if (right == "null" && (!leftType.IsValueType || underlyingType != null))
-        {
-            return Expression.Constant(null, leftType);
-        }
-
-        var stringCtor = (underlyingType ?? leftType).GetConstructor(new[] { typeof(string) });
-        if (stringCtor == null)
-        {
-            return null;
-        }
-
-        Expression constructed = Expression.New(stringCtor, FilterValue.Create(right, typeof(string)));
-        return underlyingType == null ? constructed : Expression.Convert(constructed, leftType);
-    }
-
     // True when CreateRightExprFromType can read a value of the type. For other types it throws.
     private static bool CanCreateRightExprFromType(Type type)
     {
         var targetType = TransformTargetTypeIfNullable(type);
-        return IsEnumerable(type) || TypeConversionFunctions.ContainsKey(targetType) || targetType.IsEnum || targetType == typeof(object);
+        return type.IsCollection() || TypeConversionFunctions.ContainsKey(targetType) || targetType.IsEnum || targetType == typeof(object);
     }
 
     private static Expression CreateRightExprFromType(Type leftExprType, string right, bool rightIsQuotedLiteral, ComparisonOperator op)
     {
-        var isEnumerable = IsEnumerable(leftExprType);
+        var isEnumerable = leftExprType.IsCollection();
         var targetType = leftExprType;
         if (isEnumerable)
         {
-            if (op.IsCountOperator() && (int.TryParse(right, out var intVal) || int.TryParse(right, NumberStyles.Integer, CultureInfo.InvariantCulture, out intVal)))
+            if (op.IsCountOperator() && int.TryParse(right, NumberStyles.Integer, CultureInfo.InvariantCulture, out var intVal))
             {
                 return FilterValue.Create(intVal, typeof(int));
             }
-            targetType = targetType.GetGenericArguments()[0];
+            targetType = targetType.GetCollectionElementType()!;
             return CreateRightExprFromType(targetType, right, rightIsQuotedLiteral, op);
         }
         
@@ -642,7 +708,8 @@ public static class FilterParser
 
         if (TypeConversionFunctions.TryGetValue(targetType, out var conversionFunction))
         {
-            if (right == "null")
+            // A quoted "null" is the text null for a string. Other types have no text value, so it stays a null.
+            if (right == "null" && !(rightIsQuotedLiteral && targetType == typeof(string)))
             {
                 if (rawType == typeof(Guid?))
                 {
@@ -660,7 +727,7 @@ public static class FilterParser
                 {
                     targetType = typeof(string);
                 }
-                var values = right.Trim('[', ']').Split(',').Select(x => x.Trim()).ToList();
+                var values = SplitListItems(right);
                 var elementType = targetType.IsArray ? targetType.GetElementType()! : targetType;
 
                 var expressions = values.Select(x =>
@@ -670,7 +737,7 @@ public static class FilterParser
                         x = x.Trim('"');
                     }
 
-                    var convertedValue = TypeConversionFunctions[elementType](x);
+                    var convertedValue = ConvertValue(x, elementType, () => TypeConversionFunctions[elementType](x));
                     return Expression.Constant(convertedValue, elementType);
                 }).ToArray();
 
@@ -686,7 +753,7 @@ public static class FilterParser
             if (targetType == typeof(DateTime))
             {
                 var dtStyle = right.EndsWith("Z") ? DateTimeStyles.AdjustToUniversal : DateTimeStyles.AssumeLocal;
-                var dt = DateTime.Parse(right, CultureInfo.InvariantCulture, dtStyle);
+                var dt = ConvertValue(right, targetType, () => DateTime.Parse(right, CultureInfo.InvariantCulture, dtStyle));
                 if (right.EndsWith("Z"))
                 {
                     dt = DateTime.SpecifyKind(dt, DateTimeKind.Utc);
@@ -698,44 +765,24 @@ public static class FilterParser
             if (targetType == typeof(DateTimeOffset))
             {
                 var dtStyle = right.EndsWith("Z") ? DateTimeStyles.AdjustToUniversal : DateTimeStyles.AssumeLocal;
-                var dto = DateTimeOffset.Parse(right, CultureInfo.InvariantCulture, dtStyle);
-                return FilterValue.Create(ToParameterOffset(dto), rawType);
+                var dto = ConvertValue(right, targetType, () => DateTimeOffset.Parse(right, CultureInfo.InvariantCulture, dtStyle));
+                // Npgsql only accepts a DateTimeOffset parameter with offset 0. The UTC value is the same instant.
+                return FilterValue.Create(dto.ToUniversalTime(), rawType);
             }
 
             if (targetType == typeof(DateOnly))
             {
-                var date = DateOnly.Parse(right, CultureInfo.InvariantCulture);
+                var date = ConvertValue(right, targetType, () => DateOnly.Parse(right, CultureInfo.InvariantCulture));
                 return FilterValue.Create(date, rawType);
             }
 
             if (targetType == typeof(TimeOnly))
             {
-                var time = TimeOnly.Parse(right, CultureInfo.InvariantCulture);
+                var time = ConvertValue(right, targetType, () => TimeOnly.Parse(right, CultureInfo.InvariantCulture));
 
-                int millisecond = 0, microsecond = 0;
-                if (rightIsQuotedLiteral)
-                {
-                    // Like v1.14.2, the milliseconds of a quoted value need at least 3 fraction digits and the microseconds need at least 6.
-                    if (right.Contains('.'))
-                    {
-                        var fractionalSeconds = right.Split('.')[1];
-                        if (fractionalSeconds.Length >= 3)
-                        {
-                            millisecond = int.Parse(fractionalSeconds.Substring(0, 3));
-                        }
-                        if (fractionalSeconds.Length >= 6)
-                        {
-                            microsecond = int.Parse(fractionalSeconds.Substring(3, 3));
-                        }
-                    }
-                }
-                else
-                {
-                    // v1.14.2 did not accept an unquoted fraction, so an unquoted value keeps its full fraction.
-                    var fractionalTicks = time.Ticks % TimeSpan.TicksPerSecond;
-                    millisecond = (int)(fractionalTicks / TimeSpan.TicksPerMillisecond);
-                    microsecond = (int)(fractionalTicks % TimeSpan.TicksPerMillisecond / 10);
-                }
+                var fractionalTicks = time.Ticks % TimeSpan.TicksPerSecond;
+                var millisecond = (int)(fractionalTicks / TimeSpan.TicksPerMillisecond);
+                var microsecond = (int)(fractionalTicks % TimeSpan.TicksPerMillisecond / 10);
 
                 // One microsecond is 10 ticks. The TimeOnly constructor with microseconds needs .NET 7.
                 var value = new TimeOnly(time.Hour, time.Minute, time.Second, millisecond)
@@ -753,11 +800,11 @@ public static class FilterParser
                 }
 
                 // Parse the GUID for direct comparison
-                var guidValue = Guid.Parse(right);
+                var guidValue = ConvertValue(right, targetType, () => Guid.Parse(right));
                 return FilterValue.Create(guidValue, typeof(Guid));
             }
 
-            var convertedValue = conversionFunction(right);
+            var convertedValue = ConvertValue(right, targetType, () => conversionFunction(right));
             return FilterValue.Create(convertedValue, leftExprType);
         }
 
@@ -772,7 +819,7 @@ public static class FilterParser
             
             if (right.StartsWith("[") && right.EndsWith("]"))
             {
-                var values = right.Trim('[', ']').Split(',').Select(x => x.Trim()).ToList();
+                var values = SplitListItems(right);
                 var elementType = targetType.IsArray ? targetType.GetElementType() : targetType;
             
                 var expressions = values.Select<string, Expression>(x =>
@@ -782,7 +829,7 @@ public static class FilterParser
                         x = x.Trim('"');
                     }
             
-                    var enumValue = Enum.Parse(enumType, x);
+                    var enumValue = ConvertValue(x, enumType, () => Enum.Parse(enumType, x));
                     var constant = Expression.Constant(enumValue, enumType);
             
                     return constant;
@@ -792,11 +839,7 @@ public static class FilterParser
                 return newArrayExpression;
             }
             
-            var parsed = Enum.TryParse(enumType, right, out var enumValue);
-            if (!parsed) 
-            {
-                throw new InvalidOperationException($"Unsupported value '{right}' for type '{targetType.Name}'");
-            }
+            var enumValue = ConvertValue(right, enumType, () => Enum.Parse(enumType, right));
             return FilterValue.Create(enumValue, rawType);
         }
         
@@ -817,6 +860,33 @@ public static class FilterParser
         throw new InvalidOperationException($"Unsupported value '{right}' for type '{targetType.Name}'");
     }
 
+    // Converts one filter value. The parse methods throw FormatException or OverflowException, and Enum.Parse throws
+    // ArgumentException. CreateRightExpr adds the property name and throws ParsingException.
+    private static TValue ConvertValue<TValue>(string value, Type targetType, Func<TValue> convert)
+    {
+        try
+        {
+            return convert();
+        }
+        catch (Exception e) when (e is FormatException or OverflowException or ArgumentException)
+        {
+            throw new InvalidFilterValueException(value, targetType, e);
+        }
+    }
+
+    private sealed class InvalidFilterValueException : Exception
+    {
+        public InvalidFilterValueException(string value, Type targetType, Exception inner)
+            : base(null, inner)
+        {
+            Value = value;
+            TargetType = targetType;
+        }
+
+        public string Value { get; }
+        public Type TargetType { get; }
+    }
+
     private static Type TransformTargetTypeIfNullable(Type targetType)
     {
         if (targetType.IsNullable())
@@ -825,17 +895,6 @@ public static class FilterParser
         }
 
         return targetType;
-    }
-
-    private static bool IsEnumerable(Type targetType)
-    {
-        if (targetType == typeof(string))
-        {
-            return false;
-        }
-        return targetType.IsGenericType && targetType.GetGenericTypeDefinition() == typeof(IEnumerable<>) ||
-               targetType.GetInterfaces()
-                   .Any(x => x.IsGenericType && x.GetGenericTypeDefinition() == typeof(IEnumerable<>));
     }
 
     // New arithmetic-aware comparison parser - only matches expressions in parentheses with arithmetic operators
@@ -855,14 +914,53 @@ public static class FilterParser
             .SelectMany(temp => parenthesizedArithmetic.Or(rightSideValueParser.Select(value => CreateArithmeticFromValue(value.Value))), (temp, rightSide) => new { temp.leftArithmetic, temp.op, rightSide })
             .Select(temp =>
             {
-                var leftExpr = temp.leftArithmetic.ToLinqExpression(parameter, typeof(T));
-                var rightExpr = temp.rightSide.ToLinqExpression(parameter, typeof(T));
+                var leftArithmetic = ResolveArithmeticProperties(temp.leftArithmetic, typeof(T), config);
+                var rightArithmetic = ResolveArithmeticProperties(temp.rightSide, typeof(T), config);
+                if (leftArithmetic == null || rightArithmetic == null)
+                {
+                    return IgnoredClause(config);
+                }
+
+                var leftExpr = leftArithmetic.ToLinqExpression(parameter, typeof(T));
+                var rightExpr = rightArithmetic.ToLinqExpression(parameter, typeof(T));
                 
                 var (leftCompatible, rightCompatible) = EnsureCompatibleTypes(leftExpr, rightExpr);
                 return temp.op.GetExpression<T>(leftCompatible, rightCompatible, config?.DbContextType);
             });
     }
     
+    // Resolves each property in an arithmetic expression to its member path.
+    // Returns null when a property cannot be filtered or is an allowed unknown property, because then the parser removes the clause.
+    private static ArithmeticExpression? ResolveArithmeticProperties(ArithmeticExpression expr, Type entityType, IQueryKitConfiguration? config)
+    {
+        switch (expr)
+        {
+            case PropertyArithmeticExpression property:
+                var reference = PropertyResolver.Resolve(entityType, property.PropertyPath, config);
+                // Arithmetic supports only members, so a derived property or a custom operation is unknown here
+                if (reference.Kind != PropertyReferenceKind.Member)
+                {
+                    if (config?.AllowUnknownProperties == true)
+                    {
+                        return null;
+                    }
+
+                    throw new UnknownFilterPropertyException(reference.UnknownSegment ?? property.PropertyPath);
+                }
+
+                return reference.CanFilter ? new PropertyArithmeticExpression(reference.Path) : null;
+            case BinaryArithmeticExpression binary:
+                var left = ResolveArithmeticProperties(binary.Left, entityType, config);
+                var right = ResolveArithmeticProperties(binary.Right, entityType, config);
+                return left == null || right == null ? null : new BinaryArithmeticExpression(left, binary.Operator, right);
+            case GroupedArithmeticExpression grouped:
+                var inner = ResolveArithmeticProperties(grouped.Inner, entityType, config);
+                return inner == null ? null : new GroupedArithmeticExpression(inner);
+            default:
+                return expr;
+        }
+    }
+
     private static bool ContainsArithmeticOperator(ArithmeticExpression expr)
     {
         return expr switch
@@ -902,11 +1000,6 @@ public static class FilterParser
                value.All(c => char.IsLetterOrDigit(c) || c == '_' || c == '.');
     }
 
-    // The filter settings of a left-side property: by its property path after alias replacement, in the exact case, like v1.14.2.
-    // Derived properties and custom operations are not in this lookup.
-    private static QueryKitPropertyInfo? GetFilterPropertyInfo(string text, IQueryKitConfiguration? config)
-        => config?.PropertyMappings?.GetPropertyInfo(text);
-
     private static CaseInsensitiveMode ResolveCaseMode(string? propertyPath, IQueryKitConfiguration? config)
     {
         if (!string.IsNullOrEmpty(propertyPath) && config?.PropertyMappings != null)
@@ -932,13 +1025,18 @@ public static class FilterParser
 
         var regularComparison = CreateLeftExprParser(parameter.Type, config)
             .SelectMany(reference => comparisonOperatorParser, (reference, op) => new { reference, op })
-            .SelectMany(temp => rightSideValueParser, (temp, rightValue) => new { temp.reference, temp.op, right = rightValue.Value, rightIsQuotedLiteral = rightValue.IsQuotedLiteral, cultureNumberPrefix = rightValue.CultureNumberPrefix })
+            .SelectMany(temp => rightSideValueParser, (temp, rightValue) => new { temp.reference, temp.op, right = rightValue.Value, rightIsQuotedLiteral = rightValue.IsQuotedLiteral, cultureNumberPrefix = rightValue.CultureNumberPrefix, rightIsPropertyPath = rightValue.IsPropertyPath })
             .Select(clause => BuildClauseLikeV1142(clause.cultureNumberPrefix, clause.right, right =>
             {
                 var temp = clause with { right = right };
                 if (temp.reference.Kind == PropertyReferenceKind.CustomOperation)
                 {
-                    return CreateCustomOperationExpression<T>(parameter, temp.reference.Mapping!, temp.op, temp.right);
+                    if (!temp.reference.CanFilter)
+                    {
+                        return IgnoredClause(config);
+                    }
+
+                    return CreateCustomOperationExpression<T>(parameter, temp.reference.Mapping!, temp.op, temp.right, temp.rightIsQuotedLiteral);
                 }
 
                 if (temp.reference.Kind == PropertyReferenceKind.Unknown)
@@ -968,24 +1066,39 @@ public static class FilterParser
                         var guidStringExpr = HandleGuidConversion(leftExpr, leftExpr.Type);
 
                         // For a Guid with HasConversion<string>(), v1.14.2 built the right side as a Guid and threw, so build it for the string.
-                        var guidConfig = config?.PropertyMappings?.GetPropertyInfoByQueryName(guidPropertyPath);
+                        var guidConfig = config?.PropertyMappings?.GetPropertyInfo(guidPropertyPath);
                         var leftExprForRightSide = guidConfig?.UsesConversion == true && guidConfig.ConversionTargetType == typeof(string)
                             ? guidStringExpr
                             : leftExpr;
-                        return temp.op.GetExpression<T>(guidStringExpr, CreateRightExpr(leftExprForRightSide, temp.right, temp.rightIsQuotedLiteral, temp.op, config, guidPropertyPath),
+                        return temp.op.GetExpression<T>(guidStringExpr, CreateRightExpr(leftExprForRightSide, temp.right, temp.rightIsQuotedLiteral, temp.op, temp.reference.Text, config, guidPropertyPath),
                             config?.DbContextType, ResolveCaseMode(guidPropertyPath, config));
                     }
 
                     // For non-string operators, use direct GUID comparison
-                    return temp.op.GetExpression<T>(leftExpr, CreateRightExpr(leftExpr, temp.right, temp.rightIsQuotedLiteral, temp.op, config, guidPropertyPath),
+                    return temp.op.GetExpression<T>(leftExpr, CreateRightExpr(leftExpr, temp.right, temp.rightIsQuotedLiteral, temp.op, temp.reference.Text, config, guidPropertyPath),
                         config?.DbContextType);
                 }
 
                 // Check if the right side is a property path for property-to-property comparison.
                 // A quoted string literal is always a value, even when its text matches a property name.
-                if (!temp.rightIsQuotedLiteral && IsPropertyPath(temp.right, parameter.Type))
+                // A dotted path must resolve to a property. A single identifier that is not a property stays a value.
+                if (temp.rightIsPropertyPath || !temp.rightIsQuotedLiteral && IsPropertyPath(temp.right, parameter.Type))
                 {
-                    var rightPropertyExpr = CreateRightPropertyExpr<T>(parameter, temp.right, config);
+                    // Build the right side from the resolved path, so that the checked property is the compared property.
+                    var rightReference = PropertyResolver.ResolveWithoutQueryName(parameter.Type, temp.right, config);
+                    if (!rightReference.CanFilter)
+                    {
+                        return IgnoredClause(config);
+                    }
+
+                    var rightPropertyExpr = rightReference.Kind == PropertyReferenceKind.Member
+                        ? CreateRightPropertyExpr<T>(parameter, rightReference.Path, config)
+                        : null;
+                    if (rightPropertyExpr == null && temp.rightIsPropertyPath)
+                    {
+                        // A path through a collection resolves to a member, but it is not one value to compare with.
+                        throw new UnknownFilterPropertyException(rightReference.UnknownSegment ?? temp.right);
+                    }
                     if (rightPropertyExpr != null)
                     {
                         // Handle GUID conversion for property-to-property comparisons
@@ -1087,7 +1200,7 @@ public static class FilterParser
                     }
                 }
 
-                var rightExpr = CreateRightExpr(leftExprForComparison, temp.right, temp.rightIsQuotedLiteral, temp.op, config, propertyPath);
+                var rightExpr = CreateRightExpr(leftExprForComparison, temp.right, temp.rightIsQuotedLiteral, temp.op, temp.reference.Text, config, propertyPath);
 
                 // Handle nested collection filtering
                 if (leftExprForComparison is MethodCallExpression methodCall && IsNestedCollectionExpression(methodCall))
@@ -1104,75 +1217,44 @@ public static class FilterParser
 
     private static Parser<PropertyReference> CreateLeftExprParser(Type entityType, IQueryKitConfiguration? config)
     {
-        var leftPropertyParser = IdentifierPathParser.Token();
-        var queryNameParser = DerivedOrCustomOperationQueryNameParser(config).Token();
+        var leftPropertyParser = PropertyPathParser(config).Token();
+        var identifierPathParser = IdentifierPathParser.Token();
+        var derivedOrCustomOperationQueryNames = new HashSet<string>(
+            config?.PropertyMappings?.DerivedOrCustomOperationQueryNames ?? Enumerable.Empty<string>(),
+            StringComparer.InvariantCultureIgnoreCase);
         return input =>
         {
             var left = leftPropertyParser(input);
-            var reference = left.WasSuccessful ? PropertyResolver.Resolve(entityType, left.Value, config) : null;
-            if (reference != null && (reference.Kind != PropertyReferenceKind.Unknown || config?.AllowUnknownProperties == true))
-            {
-                return Result.Success(reference, left.Remainder);
-            }
-
-            // v1.14.2 did not accept the text here, so a derived property or custom operation query name can not change an accepted filter.
-            var queryName = _queryNameFallbackOff && reference != null
-                ? Result.Failure<string>(input, "query names are off", Array.Empty<string>())
-                : queryNameParser(input);
-            if (queryName.WasSuccessful)
-            {
-                _queryNameOverUnknown |= reference != null;
-                return Result.Success(PropertyResolver.Resolve(entityType, queryName.Value, config), queryName.Remainder);
-            }
-
-            if (reference == null)
+            if (!left.WasSuccessful)
             {
                 return Result.Failure<PropertyReference>(left.Remainder, left.Message, left.Expectations);
             }
 
-            throw new UnknownFilterPropertyException(reference.UnknownSegment!);
+            // v1.14.2 read an identifier path where the grammar now reads a derived property or custom operation query name.
+            // When that identifier path is unknown, a filter that fails throws the v1.14.2 exception for it.
+            if (derivedOrCustomOperationQueryNames.Contains(left.Value))
+            {
+                var identifier = identifierPathParser(input);
+                var identifierReference = identifier.WasSuccessful ? PropertyResolver.Resolve(entityType, identifier.Value, config) : null;
+                if (identifierReference?.Kind == PropertyReferenceKind.Unknown && config?.AllowUnknownProperties != true)
+                {
+                    _queryNameOverUnknown = true;
+                    if (_queryNameFallbackOff)
+                    {
+                        throw new UnknownFilterPropertyException(identifierReference.UnknownSegment!);
+                    }
+                }
+            }
+
+            var reference = PropertyResolver.Resolve(entityType, left.Value, config);
+            if (reference.Kind == PropertyReferenceKind.Unknown && config?.AllowUnknownProperties != true)
+            {
+                throw new UnknownFilterPropertyException(reference.UnknownSegment!);
+            }
+
+            return Result.Success(reference, left.Remainder);
         };
     }
-
-    // The rewrite before the parse does not replace the query name of a derived property or a custom operation,
-    // so the grammar reads it when the identifier path is not a property. This lets the query name hold any text (for example `full-name` or `full name`).
-    // Longer query names are tried first, so a query name that starts with another query name still matches.
-    private static Parser<string> DerivedOrCustomOperationQueryNameParser(IQueryKitConfiguration? config)
-    {
-        Parser<string> parser = i => Result.Failure<string>(i, "no query name", Array.Empty<string>());
-        var mappings = config?.PropertyMappings;
-        if (mappings == null)
-        {
-            return parser;
-        }
-
-        var queryNames = mappings.DerivedPropertyMappings.Values.Concat(mappings.CustomOperationMappings.Values)
-            .Select(info => info.QueryName)
-            .Where(queryName => !string.IsNullOrEmpty(queryName))
-            .Select(queryName => queryName!)
-            .Distinct(StringComparer.InvariantCultureIgnoreCase)
-            .OrderByDescending(queryName => queryName.Length);
-        foreach (var queryName in queryNames)
-        {
-            parser = parser.Or(WholeQueryName(queryName));
-        }
-
-        return parser;
-    }
-
-    // A query name is a whole name: the next character can not continue a property path.
-    private static Parser<string> WholeQueryName(string queryName) => input =>
-    {
-        var result = Parse.IgnoreCase(queryName).Text()(input);
-        if (!result.WasSuccessful || result.Remainder.AtEnd || !IsPropertyPathChar(result.Remainder.Current))
-        {
-            return result;
-        }
-
-        return Result.Failure<string>(input, $"Query name '{queryName}' must not be followed by '{result.Remainder.Current}'", new[] { queryName });
-    };
-
-    private static bool IsPropertyPathChar(char c) => char.IsLetterOrDigit(c) || c == '_' || c == '.';
 
     private static Expression CreateLeftExpr(ParameterExpression parameter, PropertyReference reference, IQueryKitConfiguration? config)
     {
@@ -1180,15 +1262,13 @@ public static class FilterParser
             ? reference.Mapping!.DerivedExpression!
             : CreateMemberExpression(parameter, reference.Path);
 
-        if (GetFilterPropertyInfo(reference.Text, config)?.CanFilter == false)
+        if (!reference.CanFilter)
         {
             return RemovedClauseExpression.Instance;
         }
 
         // Check if this property uses HasConversion
-        var propertyConfig = config?.PropertyMappings?.GetPropertyInfoByQueryName(
-            config.PropertyMappings.GetPropertyPathByQueryName(reference.Text) ?? reference.Text);
-        if (propertyConfig?.UsesConversion == true)
+        if (reference.Mapping?.UsesConversion == true)
         {
             // For HasConversion properties, return the property expression as-is
             // EF Core will handle the type conversion automatically when it translates the expression to SQL
@@ -1201,7 +1281,7 @@ public static class FilterParser
             nestedMemberExpression.Expression is MemberExpression parentExpression)
         {
             var parentPropertyPath = GetPropertyPath(parentExpression, parameter);
-            var parentPropertyConfig = config?.PropertyMappings?.GetPropertyInfoByQueryName(parentPropertyPath);
+            var parentPropertyConfig = config?.PropertyMappings?.GetPropertyInfo(parentPropertyPath);
             
             if (parentPropertyConfig?.UsesConversion == true)
             {
@@ -1236,16 +1316,16 @@ public static class FilterParser
     {
         return memberPath.Split('.').Aggregate((Expression)parameter, (expr, memberName) =>
         {
-            if (expr is MemberExpression member && IsEnumerable(member.Type))
+            if (expr is MemberExpression member && member.Type.IsCollection())
             {
-                var genericArgType = member.Type.GetGenericArguments()[0];
+                var genericArgType = member.Type.GetCollectionElementType()!;
                 var innerParameter = Expression.Parameter(genericArgType, "y");
                 Expression lambdaBody = Expression.PropertyOrField(innerParameter, memberName);
                 var propertyType = lambdaBody.Type;
 
-                if (IsEnumerable(propertyType))
+                if (propertyType.IsCollection())
                 {
-                    propertyType = propertyType.GetGenericArguments()[0];
+                    propertyType = propertyType.GetCollectionElementType()!;
 
                     var selectManyMethod = typeof(Enumerable).GetMethods()
                         .First(m => m.Name == "SelectMany" && m.GetParameters().Length == 2)
@@ -1281,8 +1361,8 @@ public static class FilterParser
                 var lambdaBody = Expression.PropertyOrField(innerParameter, memberName);
 
                 var propertyType = lambdaBody.Type;
-                var linqMethod = IsEnumerable(propertyType) ? "SelectMany" : "Select";
-                var resultType = IsEnumerable(propertyType) ? propertyType.GetGenericArguments()[0] : propertyType;
+                var linqMethod = propertyType.IsCollection() ? "SelectMany" : "Select";
+                var resultType = propertyType.IsCollection() ? propertyType.GetCollectionElementType()! : propertyType;
 
                 var selectMethod = typeof(Enumerable).GetMethods()
                     .First(m => m.Name == linqMethod && m.GetParameters().Length == 2)
@@ -1304,10 +1384,11 @@ public static class FilterParser
         var comparisonOperatorParser = ComparisonOperatorParser(config).Token();
         var rightSideValueParser = RightSideValueParser.Token();
 
-        return PropertyListParser(IdentifierPathParser)
+        return PropertyListParser(PropertyPathParser(config))
             .SelectMany(properties => comparisonOperatorParser,
                 (properties, op) => new { properties, op })
-            .SelectMany(temp => rightSideValueParser,
+            // A property list compares with a value, so a property path on the right side does not parse.
+            .SelectMany(temp => rightSideValueParser.Where(rightValue => !rightValue.IsPropertyPath),
                 (temp, rightValue) => new { temp.properties, temp.op, right = rightValue.Value, rightIsQuotedLiteral = rightValue.IsQuotedLiteral, cultureNumberPrefix = rightValue.CultureNumberPrefix })
             .Select(clause => BuildClauseLikeV1142(clause.cultureNumberPrefix, clause.right, right =>
             {
@@ -1326,14 +1407,11 @@ public static class FilterParser
                 foreach (var fullPropPath in temp.properties)
                 {
                     // Build expression for each property. A property list does not support custom operations.
-                    // Check if property can be filtered
-                    var propertyConfig = config?.PropertyMappings?.GetPropertyInfo(fullPropPath);
-                    if (propertyConfig != null && !propertyConfig.CanFilter)
+                    var reference = PropertyResolver.Resolve(parameter.Type, fullPropPath, config);
+                    if (!reference.CanFilter)
                     {
                         continue;
                     }
-
-                    var reference = PropertyResolver.Resolve(parameter.Type, fullPropPath, config);
 
                     if (reference.Kind is PropertyReferenceKind.Unknown or PropertyReferenceKind.CustomOperation)
                     {
@@ -1356,8 +1434,8 @@ public static class FilterParser
                         leftExpr = HandleGuidConversion(leftExpr, leftExpr.Type);
                     }
 
-                    var rightExpr = CreateRightExpr(leftExpr, temp.right, temp.rightIsQuotedLiteral, temp.op, config, fullPropPath, reference.Path);
-                    var comparison = temp.op.GetExpression<T>(leftExpr, rightExpr, config?.DbContextType, ResolveCaseMode(fullPropPath, config));
+                    var rightExpr = CreateRightExpr(leftExpr, temp.right, temp.rightIsQuotedLiteral, temp.op, fullPropPath, config, reference.Path);
+                    var comparison = temp.op.GetExpression<T>(leftExpr, rightExpr, config?.DbContextType, ResolveCaseMode(reference.Path, config));
 
                     // Combine with AND for negative operators, OR for positive operators
                     result = result == null
@@ -1374,12 +1452,12 @@ public static class FilterParser
     
     private static Type? GetInnerGenericType(Type type)
     {
-        if (!IsEnumerable(type))
+        if (!type.IsCollection())
         {
             return type;
         }
 
-        var innerGenericType = type.GetGenericArguments()[0];
+        var innerGenericType = type.GetCollectionElementType()!;
         return GetInnerGenericType(innerGenericType);
     }
     
@@ -1391,18 +1469,53 @@ public static class FilterParser
         => OrExprParser<T>(parameter, config);
     
     private static Parser<Expression> AndExprParser<T>(ParameterExpression parameter, IQueryKitConfiguration? config = null)
-        => Parse.ChainOperator(
+        => ChainLeft(
             LogicalOperatorParserWithAliases(config).Where(x => x.Name == LogicalOperator.AndOperator.Operator()),
             AtomicExprParser<T>(parameter, config),
             CombineClauses<T>
         );
 
     private static Parser<Expression> OrExprParser<T>(ParameterExpression parameter, IQueryKitConfiguration? config = null)
-        => Parse.ChainOperator(
+        => ChainLeft(
             LogicalOperatorParserWithAliases(config).Where(x => x.Name == LogicalOperator.OrOperator.Operator()),
             AndExprParser<T>(parameter, config),
             CombineClauses<T>
         );
+
+    // The same left-associative chain as Parse.ChainOperator, read in a loop. Parse.ChainOperator recurses
+    // once for each operator, so a long flat chain such as a && b && ... overflowed the stack.
+    // When an operator has no operand after it, the chain ends before that operator, the same as Parse.ChainOperator.
+    private static Parser<TResult> ChainLeft<TResult, TOp>(Parser<TOp> op, Parser<TResult> operand, Func<TOp, TResult, TResult, TResult> apply)
+        => input =>
+        {
+            var first = operand(input);
+            if (!first.WasSuccessful)
+            {
+                return first;
+            }
+
+            var result = first.Value;
+            var remainder = first.Remainder;
+            while (true)
+            {
+                var opResult = op(remainder);
+                if (!opResult.WasSuccessful)
+                {
+                    break;
+                }
+
+                var next = operand(opResult.Remainder);
+                if (!next.WasSuccessful)
+                {
+                    break;
+                }
+
+                result = apply(opResult.Value, result, next.Value);
+                remainder = next.Remainder;
+            }
+
+            return Result.Success(result, remainder);
+        };
 
     private static bool RemovesIgnoredClauses(IQueryKitConfiguration? config)
         => config is IQueryKitFilterBehavior { IgnoredClauseBehavior: IgnoredClauseBehavior.Remove };
@@ -1561,8 +1674,7 @@ public static class FilterParser
         if (value == "null" || 
             value.StartsWith("\"") || 
             value.StartsWith("[") ||
-            value.Contains("-") && (DateTime.TryParse(value, out _) || DateTime.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.None, out _)) ||
-            decimal.TryParse(value, out _) ||
+            value.Contains("-") && DateTime.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.None, out _) ||
             decimal.TryParse(value, NumberStyles.Number, CultureInfo.InvariantCulture, out _) ||
             bool.TryParse(value, out _) ||
             Guid.TryParse(value, out _))
@@ -1680,14 +1792,18 @@ public static class FilterParser
         return rank1 >= rank2 ? type1 : type2;
     }
 
-    private static Expression CreateCustomOperationExpression<T>(ParameterExpression parameter, QueryKitPropertyInfo customOperationInfo, ComparisonOperator op, string rightValue)
+    private static Expression CreateCustomOperationExpression<T>(ParameterExpression parameter, QueryKitPropertyInfo customOperationInfo, ComparisonOperator op, string rightValue, bool rightIsQuotedLiteral)
     {
         if (customOperationInfo.CustomOperation == null)
             throw new ArgumentException("Custom operation expression is null");
 
         // For custom operations, we need to convert the string value to the appropriate basic type
         // instead of trying to match it to the entity type
-        object? convertedValue = ConvertStringToBasicType(rightValue);
+        // A custom operation gets the list as text, so remove the escapes that EscapeListItem added
+        if (rightValue.StartsWith("[") && rightValue.EndsWith("]"))
+            rightValue = UnescapeListText(rightValue);
+
+        object? convertedValue = ConvertStringToBasicType(rightValue, rightIsQuotedLiteral);
         
         // Create the parameter expressions for the custom operation
         var entityParameter = Expression.Convert(parameter, typeof(object));
@@ -1701,30 +1817,36 @@ public static class FilterParser
         return invocationExpression;
     }
 
-    private static object? ConvertStringToBasicType(string value)
+    private static object? ConvertStringToBasicType(string value, bool isQuotedLiteral)
     {
-        // Handle null
-        if (string.IsNullOrEmpty(value) || value.Equals("null", StringComparison.InvariantCultureIgnoreCase))
-            return null;
+        // A quoted value is text, so it never becomes null, a boolean, or a number.
+        // A quoted value in the date format of the grammar or a quoted guid still converts below.
+        if (!isQuotedLiteral)
+        {
+            // Handle null
+            if (string.IsNullOrEmpty(value) || value.Equals("null", StringComparison.InvariantCultureIgnoreCase))
+                return null;
 
-        // Try boolean
-        if (bool.TryParse(value, out var boolValue))
-            return boolValue;
+            // Try boolean
+            if (bool.TryParse(value, out var boolValue))
+                return boolValue;
 
-        // Try int
-        if (int.TryParse(value, NumberStyles.Any, CultureInfo.InvariantCulture, out var intValue))
-            return intValue;
+            // Try int
+            if (int.TryParse(value, NumberStyles.Any, CultureInfo.InvariantCulture, out var intValue))
+                return intValue;
 
-        // Try decimal
-        if (decimal.TryParse(value, NumberStyles.Any, CultureInfo.InvariantCulture, out var decimalValue))
-            return decimalValue;
+            // Try decimal
+            if (decimal.TryParse(value, NumberStyles.Any, CultureInfo.InvariantCulture, out var decimalValue))
+                return decimalValue;
 
-        // Try double
-        if (double.TryParse(value, NumberStyles.Any, CultureInfo.InvariantCulture, out var doubleValue))
-            return doubleValue;
+            // Try double
+            if (double.TryParse(value, NumberStyles.Any, CultureInfo.InvariantCulture, out var doubleValue))
+                return doubleValue;
+        }
 
         // Try DateTime
-        if (DateTime.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.AdjustToUniversal, out var dateTimeValue))
+        if ((!isQuotedLiteral || DateTimeFormatParser.End().TryParse(value).WasSuccessful) &&
+            DateTime.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.AdjustToUniversal, out var dateTimeValue))
             return dateTimeValue;
 
         // Try Guid

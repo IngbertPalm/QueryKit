@@ -14,6 +14,20 @@ public class QueryKitPropertyMappings
     internal IReadOnlyDictionary<string, QueryKitPropertyInfo> DerivedPropertyMappings => _derivedPropertyMappings;
     internal IReadOnlyDictionary<string, QueryKitPropertyInfo> CustomOperationMappings => _customOperationMappings;
 
+    // Every query name of a property
+    internal IEnumerable<string> PropertyQueryNames => QueryNamesOf(_propertyMappings.Values);
+
+    // Every query name of a derived property or a custom operation
+    internal IEnumerable<string> DerivedOrCustomOperationQueryNames
+        => QueryNamesOf(_derivedPropertyMappings.Values.Concat(_customOperationMappings.Values));
+
+    private static IEnumerable<string> QueryNamesOf(IEnumerable<QueryKitPropertyInfo> infos)
+        => infos
+            .Select(info => info.QueryName)
+            .Where(queryName => !string.IsNullOrEmpty(queryName))
+            .Select(queryName => queryName!)
+            .Distinct(StringComparer.InvariantCultureIgnoreCase);
+
     public QueryKitPropertyMapping<TModel> Property<TModel>(Expression<Func<TModel, object>>? propertySelector)
     {
         var fullPath = GetFullPropertyPath(propertySelector);
@@ -136,14 +150,10 @@ public class QueryKitPropertyMappings
                 {
                     // Use regular expression to isolate left side of the expression. Query names and
                     // operators are matched literally, so escape any regex metacharacters they contain
-                    // (e.g. the `^` in `^^` would otherwise be read as a start-of-line anchor).
-                    var regex = AliasRegexCache.Get($@"\b{Regex.Escape(queryKitPropertyInfo.QueryName!)}\b(?=\s*{Regex.Escape(op)})");
+                    // (e.g. the `^` in `^^` would otherwise be read as a start-of-line anchor). A query name
+                    // after a dot is a segment of a nested path, so it stays.
+                    var regex = AliasRegexCache.Get($@"(?<!\.)\b{Regex.Escape(queryKitPropertyInfo.QueryName!)}\b(?=\s*{Regex.Escape(op)})");
 
-                    if (queryKitPropertyInfo is { CanSort: false, CanFilter: false} && regex.IsMatch(input))
-                    {
-                        throw new InvalidOperationException($"'{queryKitPropertyInfo.Name}' is not allowed for filtering or sorting.");
-                    }
-                    
                     input = regex.Replace(input, propertyPath);
                 }
             }
@@ -412,11 +422,12 @@ public class QueryKitPropertyMappings
         if (string.IsNullOrEmpty(propertyPath))
             return null;
 
-        // Check if the property path starts with any configured property that has MaxDepth
+        // Check if the property path is, or is under, any configured property that has MaxDepth
         foreach (var mapping in _propertyMappings.Values)
         {
-            if (mapping.MaxDepth.HasValue &&
-                propertyPath.StartsWith(mapping.Name ?? "", StringComparison.OrdinalIgnoreCase))
+            if (mapping.MaxDepth.HasValue && !string.IsNullOrEmpty(mapping.Name) &&
+                (propertyPath.Equals(mapping.Name, StringComparison.OrdinalIgnoreCase) ||
+                 propertyPath.StartsWith(mapping.Name + ".", StringComparison.OrdinalIgnoreCase)))
             {
                 return mapping.MaxDepth;
             }

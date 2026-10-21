@@ -36,6 +36,10 @@ internal sealed class PropertyReference
     /// <summary>The configuration of the member, the derived property, or the custom operation, if there is one.</summary>
     public QueryKitPropertyInfo? Mapping { get; }
 
+    public bool CanFilter => Mapping?.CanFilter ?? true;
+
+    public bool CanSort => Mapping?.CanSort ?? true;
+
     /// <summary>When the reference is not a member, the first path segment that did not resolve to a member.</summary>
     public string? UnknownSegment { get; }
 
@@ -53,9 +57,20 @@ internal static class PropertyResolver
 {
     internal static PropertyReference Resolve(Type rootType, string reference, IQueryKitConfiguration? config)
     {
-        config?.ValidatePropertyDepth(reference);
+        // A query name resolves to the property path of its mapping first
+        var path = config?.PropertyMappings?.GetPropertyInfoByQueryName(reference)?.Name ?? reference;
+        return Resolve(rootType, reference, path, config);
+    }
 
-        var memberPath = ResolveMemberPath(rootType, reference, out var unknownSegment);
+    // Resolves a property path without query names. On the right side of a comparison, a query name is a value, not a property.
+    internal static PropertyReference ResolveWithoutQueryName(Type rootType, string reference, IQueryKitConfiguration? config)
+        => Resolve(rootType, reference, reference, config);
+
+    private static PropertyReference Resolve(Type rootType, string reference, string path, IQueryKitConfiguration? config)
+    {
+        config?.ValidatePropertyDepth(path);
+
+        var memberPath = ResolveMemberPath(rootType, path, out var unknownSegment);
         if (memberPath != null)
         {
             return PropertyReference.Member(reference, memberPath, config?.PropertyMappings?.GetPropertyInfo(memberPath));
@@ -78,37 +93,23 @@ internal static class PropertyResolver
 
     // Matches each segment to a member, ignoring case, in the order of Expression.PropertyOrField like v1.14.2:
     // a public property, a public field, a non-public property, and then a non-public field. An indexer does not match.
-    // A segment after a collection resolves on the element type.
-    // After a collection, only public properties match: the first segment in the exact case, a later segment in any case.
-    // A segment after a collection that does not match throws NullReferenceException.
+    // A segment after a collection resolves on the element type, with the same rules.
     private static string? ResolveMemberPath(Type rootType, string path, out string? unknownSegment)
     {
         var memberNames = new List<string>();
         var currentType = rootType;
-        var afterCollection = false;
 
         foreach (var segment in path.Split('.'))
         {
-            var firstAfterCollection = !afterCollection && memberNames.Count > 0 && IsCollection(currentType);
-            while (IsCollection(currentType))
+            while (currentType.IsCollection())
             {
-                currentType = currentType.GetGenericArguments()[0];
+                currentType = currentType.GetCollectionElementType()!;
             }
 
-            MemberInfo? member;
-            if (firstAfterCollection || afterCollection)
-            {
-                member = (firstAfterCollection ? currentType.GetProperty(segment) : currentType.GetProperty(segment, PublicMemberFlags))
-                         ?? throw new NullReferenceException();
-                afterCollection = true;
-            }
-            else
-            {
-                member = (MemberInfo?)currentType.GetProperty(segment, PublicMemberFlags)
+            var member = (MemberInfo?)currentType.GetProperty(segment, PublicMemberFlags)
                          ?? (MemberInfo?)currentType.GetField(segment, PublicMemberFlags)
                          ?? (MemberInfo?)currentType.GetProperty(segment, NonPublicMemberFlags)
                          ?? currentType.GetField(segment, NonPublicMemberFlags);
-            }
 
             if (member == null || member is PropertyInfo indexer && indexer.GetIndexParameters().Length > 0)
             {
@@ -127,9 +128,4 @@ internal static class PropertyResolver
 
     private const BindingFlags PublicMemberFlags = BindingFlags.IgnoreCase | BindingFlags.Public | BindingFlags.Instance;
     private const BindingFlags NonPublicMemberFlags = BindingFlags.IgnoreCase | BindingFlags.NonPublic | BindingFlags.Instance;
-
-    private static bool IsCollection(Type type)
-        => type != typeof(string) && type.IsGenericType &&
-           (type.GetGenericTypeDefinition() == typeof(IEnumerable<>) ||
-            type.GetInterfaces().Any(x => x.IsGenericType && x.GetGenericTypeDefinition() == typeof(IEnumerable<>)));
 }

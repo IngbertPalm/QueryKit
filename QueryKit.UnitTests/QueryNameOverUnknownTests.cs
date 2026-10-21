@@ -12,7 +12,7 @@ public class QueryNameOverUnknownTests
 {
     private static readonly QueryKitConfiguration Config = new(config =>
     {
-        config.DerivedProperty<TestingPerson>(x => x.Age * 2).HasQueryName("double age");
+        config.DerivedProperty<TestingPerson>(x => (x.Age * 2)!).HasQueryName("double age");
         config.DerivedProperty<TestingPerson>(x => x.FirstName + " " + x.LastName).HasQueryName("full-name");
         config.CustomOperation<TestingPerson>((x, op, value) => x.Age > 17).HasQueryName("is adult");
     });
@@ -43,11 +43,11 @@ public class QueryNameOverUnknownTests
     }
 
     [Fact]
-    public void failure_before_the_query_name_throws_its_own_format_exception()
+    public void failure_before_the_query_name_throws_its_own_parsing_exception()
     {
         var act = () => FilterParser.ParseFilter<TestingPerson>("""Age > "x" && is adult == true""", Config);
 
-        act.Should().ThrowExactly<FormatException>();
+        act.Should().ThrowExactly<ParsingException>().WithInnerExceptionExactly<FormatException>();
     }
 
     [Fact]
