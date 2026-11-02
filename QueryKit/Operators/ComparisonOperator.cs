@@ -63,7 +63,7 @@ public abstract class ComparisonOperator : SmartEnum<ComparisonOperator>
         var comparisonOperator = List.FirstOrDefault(x => x.Operator() == op);
         if (comparisonOperator == null)
         {
-            throw new QueryKitParsingException($"Operator {op} is not supported");
+            throw new QueryKitParsingException($"Operator {op} is not supported", QueryKitParsingReason.UnsupportedOperator, op);
         }
 
         ComparisonOperator? newOperator = null;
@@ -166,7 +166,7 @@ public abstract class ComparisonOperator : SmartEnum<ComparisonOperator>
         }
         
         return newOperator == null 
-            ? throw new QueryKitParsingException($"Operator {op} is not supported")
+            ? throw new QueryKitParsingException($"Operator {op} is not supported", QueryKitParsingReason.UnsupportedOperator, op)
             : newOperator!;
     }
 
@@ -188,6 +188,8 @@ public abstract class ComparisonOperator : SmartEnum<ComparisonOperator>
             or EndsWithType or NotEndsWithType or SoundsLikeType or DoesNotSoundLikeType;
     }
 
+    internal bool TakesList() => this is InType or NotInType;
+
     protected ComparisonOperator(string name, int value, bool caseInsensitive = false, bool usesAll = false) : base(name, value)
     {
         CaseInsensitive = caseInsensitive;
@@ -204,6 +206,12 @@ public abstract class ComparisonOperator : SmartEnum<ComparisonOperator>
         public override bool IsCountOperator() => false; 
         public override Expression GetExpression<T>(Expression left, Expression right, Type? dbContextType, CaseInsensitiveMode caseMode = CaseInsensitiveMode.Lower)
         {
+            // On a collection, a null of the collection type compares the whole collection, so only a null string is refused.
+            if (CaseInsensitive && right.Type == typeof(string))
+            {
+                EnsureStringValueIsNotNull(right, Operator());
+            }
+
             if (ComparesElements(left, right))
             {
                 return GetCollectionExpression(left, right, Expression.Equal, UsesAll);
@@ -243,6 +251,12 @@ public abstract class ComparisonOperator : SmartEnum<ComparisonOperator>
         public override bool IsCountOperator() => false; 
         public override Expression GetExpression<T>(Expression left, Expression right, Type? dbContextType, CaseInsensitiveMode caseMode = CaseInsensitiveMode.Lower)
         {
+            // On a collection, a null of the collection type compares the whole collection, so only a null string is refused.
+            if (CaseInsensitive && right.Type == typeof(string))
+            {
+                EnsureStringValueIsNotNull(right, Operator());
+            }
+
             if (ComparesElements(left, right))
             {
                 // EF Core 10 with Npgsql can not translate Any(z => z != value) on a primitive collection. Any(z => !(z == value)) translates to the same SQL.
@@ -806,7 +820,7 @@ public abstract class ComparisonOperator : SmartEnum<ComparisonOperator>
                 return GetCollectionExpression(left, right, Expression.Equal, UsesAll);
             }
 
-            throw new QueryKitParsingException("HasType is only supported for collections");
+            throw new QueryKitParsingException("HasType is only supported for collections", QueryKitParsingReason.NeedsCollection, Operator());
         }
     }
 
@@ -825,7 +839,7 @@ public abstract class ComparisonOperator : SmartEnum<ComparisonOperator>
                 return Expression.Not(GetCollectionExpression(left, right, Expression.Equal, UsesAll));
             }
             
-            throw new QueryKitParsingException("DoesNotHaveType is only supported for collections");
+            throw new QueryKitParsingException("DoesNotHaveType is only supported for collections", QueryKitParsingReason.NeedsCollection, Operator());
         }
     }
     
@@ -1031,7 +1045,7 @@ public abstract class ComparisonOperator : SmartEnum<ComparisonOperator>
     {
         if (!right.Type.IsCollection())
         {
-            throw new QueryKitParsingException($"The {Operator()} operator needs a list value, for example [\"a\", \"b\"].");
+            throw new QueryKitParsingException($"The {Operator()} operator needs a list value, for example [\"a\", \"b\"].", QueryKitParsingReason.NeedsList, Operator());
         }
     }
 
@@ -1131,7 +1145,7 @@ public abstract class ComparisonOperator : SmartEnum<ComparisonOperator>
     {
         if (right is ConstantExpression { Value: null })
         {
-            throw new QueryKitParsingException($"The '{op}' operator does not accept a null value. Use '==' or '!=' to compare with null.");
+            throw new QueryKitParsingException($"The '{op}' operator does not accept a null value. Use '==' or '!=' to compare with null.", QueryKitParsingReason.RefusesNull, op);
         }
     }
 

@@ -52,12 +52,25 @@ public static class SortParser
 
         if (direction != Ascending && direction != Descending)
         {
-            throw new QueryKitParsingException($"Invalid direction: {direction}. Allowed values are '{Ascending}' and '{Descending}'.");
+            throw new QueryKitParsingException($"Invalid direction: {direction}. Allowed values are '{Ascending}' and '{Descending}'.", QueryKitParsingReason.UnsupportedOperator, direction);
         }
 
         var reference = PropertyResolver.Resolve(typeof(T), propertyName, config);
+        // The sort finds a member such as Tags.Count with its own lookup, so only the allow-list refuses an unknown reference.
+        // A custom operation has no sort expression, and the lookup would sort an unlisted member with the same name.
+        if (config is IQueryKitAllowList { UseAllowList: true }
+            && reference.Kind is PropertyReferenceKind.Unknown or PropertyReferenceKind.CustomOperation)
+        {
+            throw new SortParsingException(propertyName);
+        }
+
         if (reference.Kind != PropertyReferenceKind.CustomOperation && !reference.CanSort)
         {
+            if (config is IQueryKitFilterBehavior { IgnoredClauseBehavior: IgnoredClauseBehavior.Throw })
+            {
+                throw PreventedPropertyException.ForSort(propertyName);
+            }
+
             return new SortExpressionInfo<T>
             {
                 Expression = null,

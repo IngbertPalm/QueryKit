@@ -122,6 +122,8 @@ var input = """(Age ^^ [20, 30, 40]) && (BirthMonth ^^* ["January", "February", 
 
 A quoted list item can hold a comma. For example, `Title ^^ ["Warm, with syrup", "Cold"]` has two items: `Warm, with syrup` and `Cold`.
 
+The in operators also read a quoted list as a list, so `Title ^^ "[Pancakes, Beef Stew]"` has two items. For every other operator, a quoted `[...]` is text. For example, `Title == "[draft]"` compares `Title` with the text `[draft]`.
+
 ### Property List Grouping
 
 Property list grouping allows you to apply a single comparison operation across multiple properties, making it easy to search for a value in any of several fields without writing repetitive conditions.
@@ -240,12 +242,31 @@ Property list grouping is particularly useful for:
 
   * `null` doesn't need quotes: `var input = "Title == null";`
 
+  * `==*` and `!=*` do not accept `null`, because a null value has no case. `Title ==* null` throws a `QueryKitParsingException`. Use `==` or `!=` to compare with null.
+
   * Double quotes can be escaped by using a similar syntax to raw-string literals introduced in C#11:
 
     ```c#
     var input = """""Title == """lamb is great on a "gee-ro" not a "gy-ro" sandwich""" """"";
     // OR 
     var input = """""""""Title == """"lamb is great on a "gee-ro" not a "gy-ro" sandwich"""" """"""""";
+    ```
+
+  * The full run of quotes at the start of the value is the opening delimiter. The closing delimiter has the same number of quotes. Thus a quote at the start of the value becomes part of the delimiter. For example, `""""hi""""` is the value `hi` with a delimiter of four quotes. It is not the value `"hi"`.
+
+  * To write a value that starts or ends with a double quote, put one space between each delimiter and the value. If the value starts with a space, ends with a space, and has a character that is not a space, QueryKit removes one space from each end. Only the space character counts. QueryKit does not remove tabs. The rule applies to every operator and to the items of a list, for example `Title ^^ [""" "a" """, "b"]`. In a list, QueryKit also removes all whitespace from the start and end of each item. Thus the table below is true only for a single value.
+
+    | Value in the filter | Value that QueryKit uses |
+    | ------------------- | ------------------------ |
+    | `""" "hi" """` | `"hi"` |
+    | `""" "hi" now """` | `"hi" now` |
+    | `""" say "hi" """` | `say "hi"` |
+    | `"""  x  """` | `x` with one space on each side |
+    | `""" x"""` | `x` with one space before it. Only one end has a space, so QueryKit removes no space. |
+    | `"""   """` | Three spaces. QueryKit does not change a value of only spaces. |
+
+    ```c#
+    var input = """"Title == """ "hi" """ """";
     ```
 
 * Dates and times use ISO 8601 format and should be surrounded by double quotes:
@@ -740,6 +761,28 @@ var config = new QueryKitConfiguration(config =>
 var filterExpression = FilterParser.ParseFilter<Recipe>(input, config);
 ```
 
+#### Allow List
+
+By default, a filter or a sort can use every member of the type. This includes a member of a member, such as `StartsAt.Ticks`, and a private property. Set `UseAllowList` to `true` to limit filters and sorts to the properties that your configuration names. A property is on the list when it has a `Property` mapping, or when it is a derived property or a custom operation.
+
+```csharp
+var config = new QueryKitConfiguration(config =>
+{
+    config.UseAllowList = true;
+    config.Property<Recipe>(x => x.Title);
+    config.Property<Recipe>(x => x.Rating).PreventSort();
+    config.Property<Recipe>(x => x.Author.Name).HasQueryName("chef");
+});
+```
+
+- A mapping allows only its own path. `Author.Name` does not allow `Author` or `Author.Id`, and `CreatedAt` does not allow `CreatedAt.Year`.
+- A property that is not on the list is unknown. A filter on it throws `UnknownFilterPropertyException`, and a sort on it throws `SortParsingException`. For a filter, when `AllowUnknownProperties` is `true`, `IgnoredClauseBehavior` decides what happens to the clause.
+- A sort on a custom operation throws `SortParsingException`, because a custom operation has no sort expression.
+- `PreventFilter` and `PreventSort` still apply to a property on the list. For example, `Rating` above can filter but cannot sort.
+- On the right side of a comparison, one word that is not on the list is text, the same as any unknown word. `Title == Sku` compares `Title` with the text `Sku`.
+
+`UseAllowList` comes from the `IQueryKitAllowList` interface, so a custom configuration class can implement it directly.
+
 #### Case-Insensitive Comparison Mode
 
 By default, QueryKit uses `ToLower()` (which EF Core translates to `LOWER()` in SQL) for case-insensitive string operators like `@=*`, `_=*`, `==*`, etc. If your data is normalized to uppercase, you can switch to `ToUpper()` / `UPPER()` to maintain index efficiency.
@@ -756,7 +799,7 @@ This is particularly useful when:
 - Database indexes are defined on uppercase column values (e.g., `CREATE INDEX ON people (UPPER(email))`)
 - You need SARGable queries for better performance
 
-**Per-property override** — you can also control the mode per property, overriding the global setting:
+**Per-property override.** You can also set the mode for one property. This setting overrides the global setting:
 
 ```csharp
 var config = new QueryKitConfiguration(settings =>
@@ -827,6 +870,8 @@ var filterExpression = FilterParser.ParseFilter<Recipe>(input, config);
 `IgnoredClauseBehavior` and `ParameterizeFilterValues` both come from the `IQueryKitFilterBehavior` interface. `QueryKitConfiguration` implements this interface, so a custom configuration class can implement `IQueryKitFilterBehavior` directly instead.
 
 `IgnoredClauseBehavior` controls what QueryKit does with a clause on a property that has `PreventFilter`, or on an unknown property when `AllowUnknownProperties` is `true`. The default is `IgnoredClauseBehavior.ReplaceWithTrue`, which replaces the clause with `true == true` so the rest of the expression keeps its shape. A property-list clause (for example `(FirstName, Title) @=* "x"`) where every property is prevented gives a plain `true` instead, not `true == true`. Set `IgnoredClauseBehavior` to `IgnoredClauseBehavior.Remove` to drop the clause instead, so a logical operator with a removed side keeps only its other side.
+
+With the default, a client that filters on a prevented property gets every row under an `||`, and gets no error. Set `IgnoredClauseBehavior` to `IgnoredClauseBehavior.Throw` to refuse the filter instead. A clause on a property that has `PreventFilter` then throws a `PreventedPropertyException`, and a sort on a property that has `PreventSort` throws the same exception. Its `PropertyName` holds the property as the client wrote it. A clause on an unknown property throws `UnknownFilterPropertyException`, also when `AllowUnknownProperties` is `true`.
 
 ```csharp
 var config = new QueryKitConfiguration(config =>
@@ -1034,12 +1079,25 @@ any exception thrown by QueryKit.
 * A `ParsingException` will be thrown when there is an invalid operator or bad syntax is used. Note that an unquoted string value, such as `Title == salt`, does not throw. QueryKit reads it as the literal text `salt`.
 * An `UnknownFilterPropertyException` will be thrown if a property is not recognized during filtering
 * A `SortParsingException` will be thrown if a property or operation is not recognized during sorting
+* A `PreventedPropertyException` will be thrown for a filter or sort on a prevented property when `IgnoredClauseBehavior` is `Throw`. See [Ignored Clause Behavior](#ignored-clause-behavior).
 * A `QueryKitDbContextTypeException` will be thrown when trying to use a `DbContext` specific workflow without passing that context (e.g. SoundEx)
 * A `SoundsLikeNotImplementedException` will be thrown when trying to use `soundex` on a `DbContext` that doesn't have it implemented.
 * A `QueryKitParsingException` is a more generic error that will include specific details on a more granular error in the parsing pipeline.
 * A `QueryKitPropertyDepthExceededException` will be thrown when a property path exceeds the configured `MaxPropertyDepth` limit.
 * A `QueryKitInputLengthExceededException` will be thrown when a filter string exceeds the configured `MaxInputLength` limit.
 * A `QueryKitNestingDepthExceededException` will be thrown when a filter string exceeds the configured `MaxNestingDepth` limit.
+
+Read the data of an exception from its properties, not from its message. A message can change in a later version.
+
+| Exception | Properties |
+|---|---|
+| `UnknownFilterPropertyException` | `PropertyName` |
+| `SortParsingException` | `PropertyName` |
+| `PreventedPropertyException` | `PropertyName` |
+| `ParsingException` | `PropertyName`, `TargetType`, and `Value` for a value that does not convert. `Line` and `Column` for a syntax failure. |
+| `QueryKitParsingException` | `Reason` (a `QueryKitParsingReason`, for example `NeedsList` or `RefusesNull`) and `Operator` |
+
+`ParsingException.Value` is the text that the client sent. Treat it as user input, for example before you write it to a log.
 
 ## SoundEx
 

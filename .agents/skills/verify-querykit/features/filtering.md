@@ -32,6 +32,7 @@ Preconditions:
 - **Logic and parentheses.** Run `qk run filtering-logic --filter '(IsVegetarian == true && Rating < 2) || Title == "Beef Stew"'`. Both targets give `["Beef Stew", "Plain Water"]`.
 - **In operator.** Run `qk run filtering-in --filter 'Rating ^^ [3, 5]'`. Both targets give `["Pancakes", "Beef Stew"]`.
 - **In operator with one value.** Run `qk run filtering-in-one-value --filter 'Title ^^ "Pancakes"'`. Both targets give `error.type` `QueryKit.Exceptions.QueryKitParsingException` with `isQueryKitException` true. The message says that the operator needs a list value.
+- **Quoted list form.** Run `qk run filtering-quoted-list --filter 'Title @=* "[a]"'`. Both targets give `[]` with no error, because a quoted `[...]` is a string. Then drive `Title ^^ "[Pancakes, Beef Stew]"`. Both targets give `["Pancakes", "Beef Stew"]`, because the in operators read a quoted `[...]` as a list.
 - **Enum by integer.** Run `qk run filtering-enum --filter 'Visibility == 2'`. Both targets give `["Salt Bread", "Plain Water"]`. The `expression` shows `x.Visibility == Private`.
 - **Date and null.** Run `qk run filtering-date-null --filter 'CreatedAt >= "2024-03-01T00:00:00Z" && DateOfOrigin != null'`. Both targets give `["Salt Bread"]`.
 - **Property grouping.** Run `qk run filtering-group --filter '(Title, Directions) @=* "bake"'`. Both targets give `["Salt Bread"]`.
@@ -42,6 +43,6 @@ Preconditions:
 
 - Without `--sort`, both targets return rows in seed order. The Postgres order comes from the `ORDER BY r."Id"` that EF Core adds, not from QueryKit.
 - An unquoted value such as `Title == salt` does not throw. QueryKit reads it as the literal `"salt"` and returns no rows.
-- `Title @= null` throws `QueryKitParsingException` on both targets. The message tells the client to use `==` or `!=` for null.
+- `Title @= null` throws `QueryKitParsingException` on both targets. The message tells the client to use `==` or `!=` for null. `Title ==* null` and `Title !=* null` throw the same way.
 - `Rating > "abc"` throws `ParsingException` on both targets (see `error-handling.md`).
 - The case-insensitive operators use `lower()` in SQL by default. The `upper` preset changes this (see `configuration.md`).
